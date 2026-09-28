@@ -1503,7 +1503,24 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
 # using local source footage -- see EventRecorder's manifest_only docstring.
 # --------------------------------------------------------------------------
 
-def extract_clips(input_path, manifest_path, output_dir):
+def _extract_one(event, input_dir, output_dir):
+    """Cuts a single manifest event into a clip. Module-level (not a closure)
+    so it can be pickled and handed to a ProcessPoolExecutor worker."""
+    out_path = output_dir / event["clip_name"]
+    segments = [(input_dir / name, start, end, 1, 1) for name, start, end in event["segments"]]
+    reader = ChainedVideoReader(segments)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, reader.fps or 25.0, (reader.width, reader.height))
+    while True:
+        ok, frame = reader.read()
+        if not ok:
+            break
+        writer.write(frame)
+    writer.release()
+    reader.release()
+
+
+def extract_clips(input_path, manifest_path, output_dir, workers=1):
     """Reads events_manifest.jsonl (one JSON object per line: {"clip_name":
     ..., "segments": [[filename, start_frame, end_frame], ...]}) and cuts
     each event into a real clip in output_dir, reading source files by bare
@@ -1517,13 +1534,17 @@ def extract_clips(input_path, manifest_path, output_dir):
     looks past one flat directory level either, so the bare filename is
     already everything needed to resolve it against a *local* --input.
 
-    Single-threaded and no motion detection here -- this is pure seek+copy
-    (reusing ChainedVideoReader's existing GOP seek-warmup, so no re-run of
-    the corrupted-frame risk that motivated it), typically much cheaper per
-    clip than the original scan, so parallelizing wasn't worth the added
-    complexity for a first version. Existing output files are left alone
-    (skipped) unless removed first -- there's no --force here yet since
-    nothing has needed it.
+    No motion detection here -- this is pure seek+copy (reusing
+    ChainedVideoReader's existing GOP seek-warmup, so no re-run of the
+    corrupted-frame risk that motivated it), typically much cheaper per clip
+    than the original scan. Unlike scan()'s --workers, events have no
+    ordering/continuity constraint between them (each is an independent
+    seek+copy of its own file range), so splitting them across a
+    ProcessPoolExecutor pool is a plain map with no partitioning logic
+    needed. `workers=1` (the default) skips the pool entirely and runs
+    in-process, matching the original single-threaded behavior. Existing
+    output files are left alone (skipped) unless removed first -- there's
+    no --force here yet since nothing has needed it.
     """
     input_dir = Path(input_path)
     output_dir = Path(output_dir)
@@ -1539,29 +1560,37 @@ def extract_clips(input_path, manifest_path, output_dir):
         print(f"[motion-scan] No events in {manifest_path}; nothing to extract.")
         return
 
-    extracted = 0
+    pending = []
     skipped = 0
-    for i, event in enumerate(events, 1):
-        out_path = output_dir / event["clip_name"]
-        if out_path.exists():
+    for event in events:
+        if (output_dir / event["clip_name"]).exists():
             skipped += 1
-            continue
-        segments = [(input_dir / name, start, end, 1, 1) for name, start, end in event["segments"]]
-        reader = ChainedVideoReader(segments)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, reader.fps or 25.0, (reader.width, reader.height))
-        while True:
-            ok, frame = reader.read()
-            if not ok:
-                break
-            writer.write(frame)
-        writer.release()
-        reader.release()
-        extracted += 1
-        print(f"[motion-scan] [{i}/{len(events)}] Extracted {out_path.name}")
-
+        else:
+            pending.append(event)
     if skipped:
-        print(f"[motion-scan] Skipped {skipped} clip(s) that already exist in {output_dir}.")
+        print(f"[motion-scan] Skipping {skipped} clip(s) that already exist in {output_dir}.")
+
+    extracted = 0
+    if workers <= 1 or len(pending) <= 1:
+        for i, event in enumerate(pending, 1):
+            _extract_one(event, input_dir, output_dir)
+            extracted += 1
+            print(f"[motion-scan] [{i}/{len(pending)}] Extracted {event['clip_name']}")
+    else:
+        import concurrent.futures
+
+        workers = min(workers, len(pending))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            future_to_name = {
+                pool.submit(_extract_one, event, input_dir, output_dir): event["clip_name"]
+                for event in pending
+            }
+            for i, fut in enumerate(concurrent.futures.as_completed(future_to_name), 1):
+                name = future_to_name[fut]
+                fut.result()
+                extracted += 1
+                print(f"[motion-scan] [{i}/{len(pending)}] Extracted {name}")
+
     print(f"[motion-scan] Done. {extracted} clip(s) extracted to {output_dir}.")
 
 
@@ -1699,6 +1728,10 @@ def main():
                                                               "--folder is given.")
     p_extract.add_argument("--output", default=None, help="Folder to write extracted clips into. Defaults to "
                                                             "<folder>/output if --folder is given.")
+    p_extract.add_argument("--workers", type=int, default=None,
+                            help="Number of clips to extract in parallel (process pool). Events are "
+                                 f"independent so this is a plain split, no partitioning. Default "
+                                 f"os.cpu_count()-1 = {max(1, (os.cpu_count() or 2) - 1)} on this machine.")
 
     args = parser.parse_args()
 
@@ -1724,7 +1757,8 @@ def main():
         if not output_path:
             raise SystemExit("Need --output, or --folder (which defaults --output to <folder>/output).")
         manifest_path = args.manifest or str(Path(output_path) / "events_manifest.jsonl")
-        extract_clips(input_path, manifest_path, output_path)
+        extract_clips(input_path, manifest_path, output_path,
+                      workers=args.workers or max(1, (os.cpu_count() or 2) - 1))
 
 
 if __name__ == "__main__":
