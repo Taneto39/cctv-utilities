@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+
+# raw footage and scan output -- never want these in git (large binaries,
+# and they're per-camera/per-day data, not code)
+data/
+data_h264/
+data_h264_pipeline/
+output/
+output_h265/
+output_h264/
+output_h264_pipeline/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.ts
+*.dav
+
+# motion_scan.py resume-state files
+.motion_scan_state.json
+
+# YOLO model weights -- large binaries, auto-downloaded/cached by ultralytics
+*.pt
+
+# docs for claude
+.claude/
+docs/
+CLAUDE.md
+CONTEXT.md
+DESIGN.md
+PROGRESS.md

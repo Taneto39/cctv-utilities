@@ -1,0 +1,14 @@
+# Core -- motion_scan.py, rename scripts
+opencv-python
+numpy
+tqdm
+
+# Second-pass object detection -- detect_objects.py
+# (pulls in torch automatically; comment out if you only need motion_scan.py)
+ultralytics
+
+# Optional: GPU compute for motion_scan.py. NOT installed by default on
+# purpose -- benchmarked slower than --no-gpu on the dev machine once
+# several workers share one GPU (see CLAUDE.md/DESIGN.md). If you want to
+# re-test on different hardware:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
