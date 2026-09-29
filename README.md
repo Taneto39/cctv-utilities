@@ -113,11 +113,17 @@ python motion_scan.py scan --folder "/mnt/cam1" --workers 8 --manifest-only
 # บนเครื่อง local กับไฟล์วิดีโอต้นฉบับตัวเดียวกัน (มีแค่สำเนาที่ถูกอัปโหลด
 # ไป ต้นฉบับไม่เคยออกจากเครื่อง local เลย) ตัดคลิปจริง:
 python motion_scan.py extract --folder "F:/cam1" --manifest "F:/cam1/output/events_manifest.jsonl"
+
+# ตัดหลายคลิปพร้อมกัน (ค่าเริ่มต้น --workers คือ os.cpu_count()-1 เหมือน scan):
+python motion_scan.py extract --folder "F:/cam1" --manifest "F:/cam1/output/events_manifest.jsonl" --workers 8
 ```
 
 `extract` จะอ่าน manifest แล้ว seek ไปตัดคลิปจริงจาก `data/` local
 โดยตรง -- ไม่ต้องรัน motion detection ซ้ำ จึงเบามาก (แค่ seek + copy
-ใช้วิธี seek แบบ warm-up GOP เดียวกับตอน scan) ชื่อไฟล์ใน manifest จะเป็น
+ใช้วิธี seek แบบ warm-up GOP เดียวกับตอน scan) แต่ละ event ใน manifest
+เป็นงานอิสระต่อกัน (ไม่มีเงื่อนไขเรียงลำดับแบบ `scan --workers`) เลย
+`--workers` ของ `extract` แค่แจกงานทีละคลิปให้แต่ละ process ตรงๆ ไม่มี
+partition ซับซ้อน ชื่อไฟล์ใน manifest จะเป็น
 ชื่อเปล่าๆ (ไม่มี path ของโฟลเดอร์) โดยตั้งใจ เพื่อให้ manifest ที่สร้างจาก
 path แบบ Linux บน cloud VM ยังใช้กับ `--input` แบบ Windows บนเครื่อง local
 ได้ปกติ -- `extract` แค่เอาชื่อไฟล์ไปต่อกับ `--input` ของตัวเอง
