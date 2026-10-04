@@ -44,10 +44,13 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import queue as queue_mod
 import re
 import subprocess
+import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Must be set before cv2's ffmpeg backend initializes (it reads this once,
@@ -774,6 +777,97 @@ def _clear_state(state_path):
         pass
 
 
+class _RunLog:
+    """Append-only wall-clock record of every `scan` invocation, in
+    <output>/scan_runs.jsonl -- one `start` line, periodic `checkpoint`
+    lines, one `end` line, all sharing a `run_id`. Exists because the
+    tqdm bars are NOT a trustworthy throughput measurement: their rate is
+    a smoothed instantaneous value, and progress-queue lag makes it stall
+    then jump by ten-thousand-frame bursts (seen on the local machine and
+    on the 2026-09-29 GCE pilot, where "~896fps with 1.3-33fps per worker"
+    was read off the bars and may be display artifact rather than real I/O
+    contention -- see PROGRESS.md). The `end` record's `fps` is frames /
+    wall-clock for that invocation only -- it doesn't depend on tqdm.
+
+    Never cleared by --restart or on completion, so a resumed job leaves
+    one start/end pair per invocation, all sharing the same `job` hash
+    (the resume fingerprint) -- group by `job` to see a whole job across
+    resumes. A run killed without a chance to clean up (SIGKILL, spot VM
+    preemption) leaves a `start` and maybe `checkpoint`s but no `end`,
+    which is itself the signal that it didn't finish.
+
+    `checkpoint.queue_backlog` is the progress queue's depth when it was
+    written: a large or growing number means the main process isn't
+    draining worker reports fast enough, i.e. the bars are lagging reality
+    (frames_reported undercounts) rather than the workers being slow.
+
+    Logging is best-effort -- a write failure must never break a scan."""
+
+    CHECKPOINT_EVERY_S = 30
+
+    def __init__(self, output_dir, note=None):
+        self.path = Path(output_dir) / "scan_runs.jsonl"
+        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.note = note
+        self.events = None
+        self._t_created = time.monotonic()
+        self._t0 = None
+        self._last_cp = None
+        self._pending_frames = None
+        self._frames_reported = 0
+        self._finished = False
+
+    def _write(self, rec):
+        rec = {"run_id": self.run_id, "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **rec}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+
+    def start(self, job, settings, resumed, segments_total, segments_pending, frames_pending):
+        self._t0 = self._last_cp = time.monotonic()
+        self._pending_frames = frames_pending
+        self._write({"type": "start", "job": job[:12], "note": self.note, "host": platform.node(),
+                     "os": platform.system(), "cpus": os.cpu_count(), "resumed": resumed,
+                     "prep_s": round(self._t0 - self._t_created, 1), "segments_total": segments_total,
+                     "segments_pending": segments_pending, "frames_pending": frames_pending,
+                     "settings": settings})
+
+    def tick(self, frames_reported, queue_backlog_fn=None):
+        """Call from the main progress loop as often as convenient; only
+        actually writes every CHECKPOINT_EVERY_S."""
+        self._frames_reported = int(frames_reported)
+        if self._t0 is None:
+            return
+        now = time.monotonic()
+        if now - self._last_cp < self.CHECKPOINT_EVERY_S:
+            return
+        self._last_cp = now
+        try:
+            backlog = queue_backlog_fn() if queue_backlog_fn else None
+        except Exception:
+            backlog = None
+        self._write({"type": "checkpoint", "elapsed_s": round(now - self._t0, 1),
+                     "frames_reported": self._frames_reported, "queue_backlog": backlog})
+
+    def finish(self, status):
+        if self._t0 is None or self._finished:
+            return
+        self._finished = True
+        elapsed = time.monotonic() - self._t0
+        rec = {"type": "end", "status": status, "elapsed_s": round(elapsed, 1), "events": self.events}
+        if status == "completed" and self._pending_frames and elapsed > 0:
+            fps = self._pending_frames / elapsed
+            rec.update(frames=self._pending_frames, fps=round(fps, 1))
+            print(f"[motion-scan] Run summary: {self._pending_frames} frames in {elapsed:.0f}s wall-clock "
+                  f"= {fps:.1f} fps (this invocation only; logged to {self.path}).")
+        else:
+            rec["frames_reported"] = self._frames_reported
+        self._write(rec)
+
+
 # --------------------------------------------------------------------------
 # Main scan
 # --------------------------------------------------------------------------
@@ -1041,7 +1135,7 @@ def _build_dispatch_pieces(positions, units, target_piece_frames):
 def _scan_dynamic(units, positions, points, output_dir, threshold, min_event_len, pre, post,
                   use_gpu, downscale, use_nvdec, frame_skip, workers, nvdec_workers,
                   state_path, fingerprint, total_segments_all, completed_segments,
-                  manifest_only=False, manifest_path=None):
+                  manifest_only=False, manifest_path=None, runlog=None):
     """--dynamic's worker-management path: instead of pre-assigning each
     worker a fixed, upfront share of the timeline (scan()'s static
     contiguous partition), cut the pending timeline into more, smaller
@@ -1122,6 +1216,7 @@ def _scan_dynamic(units, positions, points, output_dir, threshold, min_event_len
         }
         done_count = 0
         while done_count < len(future_to_idx):
+            runlog.tick(overall_bar.n, progress_queue.qsize)
             try:
                 prefix, idx, events, done, completed_segment, new_events = progress_queue.get(timeout=0.5)
             except queue_mod.Empty:
@@ -1144,6 +1239,7 @@ def _scan_dynamic(units, positions, points, output_dir, threshold, min_event_len
         for fut in concurrent.futures.as_completed(future_to_idx):
             total_events += fut.result()[0]
 
+    runlog.events = total_events
     if manifest_f is not None:
         manifest_f.close()
     for bar in bars.values():
@@ -1158,9 +1254,23 @@ def _scan_dynamic(units, positions, points, output_dir, threshold, min_event_len
               f"({len(units)} segment(s) just processed, {total_segments_all} total including any skipped on resume).")
 
 
-def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
-         pre=2.0, post=2.0, use_gpu=False, downscale=1, use_nvdec=False, frame_skip=1, workers=1,
-         restart=False, nvdec_workers=0, dynamic=False, manifest_only=False):
+def scan(input_path, region_path, output_dir, *args, note=None, **kwargs):
+    """Runs one scan invocation (see _scan_impl for the real parameters) and
+    records it in <output>/scan_runs.jsonl (see _RunLog). `note` is a free
+    label stored in that log -- e.g. "c2d-32 pd-ssd 500GB" -- so runs on
+    different machines/disks can be told apart later."""
+    runlog = _RunLog(output_dir, note=note)
+    try:
+        _scan_impl(input_path, region_path, output_dir, *args, runlog=runlog, **kwargs)
+    except BaseException:
+        runlog.finish("interrupted")
+        raise
+    runlog.finish("completed")
+
+
+def _scan_impl(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
+               pre=2.0, post=2.0, use_gpu=False, downscale=1, use_nvdec=False, frame_skip=1, workers=1,
+               restart=False, nvdec_workers=0, dynamic=False, manifest_only=False, runlog=None):
     paths = discover_videos(input_path)
     with open(region_path) as f:
         region = json.load(f)
@@ -1222,6 +1332,10 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
     fingerprint = _fingerprint_job(paths, region_path, output_dir, threshold, min_event_len,
                                    pre, post, use_gpu, downscale, use_nvdec, frame_skip, manifest_only)
     saved = None if restart else _load_state(state_path, fingerprint)
+    log_settings = {"workers": workers, "threshold": threshold, "min_event_len": min_event_len, "pre": pre,
+                    "post": post, "gpu": use_gpu, "downscale": downscale, "nvdec": use_nvdec,
+                    "nvdec_workers": nvdec_workers, "frame_skip": frame_skip, "dynamic": dynamic,
+                    "manifest_only": manifest_only, "restart": restart}
 
     # events_manifest.jsonl is append-only across resumed runs, mirroring
     # the segment-resume state it's written alongside -- a genuine resume
@@ -1238,9 +1352,12 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
             print(f"[motion-scan] Already completed in a previous run (per {state_path}); nothing to do. "
                   "Pass --restart to force a full re-run.")
             return
+        runlog.start(fingerprint, log_settings, resumed=False, segments_total=total_segments_all,
+                     segments_pending=total_segments_all, frames_pending=sum(frame_counts))
         total_events, manifest_events = _run_stream([paths], points, output_dir, threshold, min_event_len, pre, post,
                                    use_gpu, downscale, use_nvdec, frame_skip, name_prefix="",
                                    manifest_only=manifest_only)
+        runlog.events = total_events
         if manifest_only:
             with open(manifest_path, "a") as f:
                 for ev in manifest_events:
@@ -1307,11 +1424,14 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
             print(f"[motion-scan] Done. All {total_segments_all} segment(s) were already completed; nothing to do.")
             return
 
+    runlog.start(fingerprint, log_settings, resumed=bool(completed_segments), segments_total=total_segments_all,
+                 segments_pending=len(units), frames_pending=sum(u[0] for u in units))
+
     if dynamic:
         _scan_dynamic(units, positions, points, output_dir, threshold, min_event_len, pre, post,
                       use_gpu, downscale, use_nvdec, frame_skip, workers, nvdec_workers,
                       state_path, fingerprint, total_segments_all, completed_segments,
-                      manifest_only=manifest_only, manifest_path=manifest_path)
+                      manifest_only=manifest_only, manifest_path=manifest_path, runlog=runlog)
         return
 
     # Contiguous prefix-sum partition: walk `units` in their existing
@@ -1462,6 +1582,7 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
         }
         done_count = 0
         while done_count < len(future_to_idx):
+            runlog.tick(overall_bar.n, progress_queue.qsize)
             try:
                 prefix, idx, events, done, completed_segment, new_events = progress_queue.get(timeout=0.5)
             except queue_mod.Empty:
@@ -1484,6 +1605,7 @@ def scan(input_path, region_path, output_dir, threshold=0.15, min_event_len=1.0,
         for fut in concurrent.futures.as_completed(future_to_idx):
             total_events += fut.result()[0]
 
+    runlog.events = total_events
     if manifest_f is not None:
         manifest_f.close()
     for bar in bars.values():
@@ -1713,6 +1835,11 @@ def main():
                              "unlike upload), then run 'extract' locally against the same source footage "
                              "(still on disk -- only a copy was uploaded) to cut the actual clips at zero "
                              "detection cost. See the 'extract' subcommand.")
+    p_scan.add_argument("--note", default=None,
+                        help="Free-text label stored in <output>/scan_runs.jsonl for this run (e.g. "
+                             "'c2d-32 pd-ssd 500GB') so runs on different machines/disks can be compared "
+                             "later. Every scan invocation is logged there regardless, with wall-clock "
+                             "fps -- unlike the tqdm bars, which can stall and jump under progress-queue lag.")
 
     p_extract = sub.add_parser("extract", help="Cut real clips from a manifest produced by "
                                                 "'scan --manifest-only', reading local source footage.")
@@ -1747,7 +1874,7 @@ def main():
              use_nvdec=args.nvdec, frame_skip=args.frame_skip,
              workers=args.workers or max(1, (os.cpu_count() or 2) - 1),
              restart=args.restart, nvdec_workers=args.nvdec_workers, dynamic=args.dynamic,
-             manifest_only=args.manifest_only)
+             manifest_only=args.manifest_only, note=args.note)
     elif args.command == "extract":
         folder = Path(args.folder) if args.folder else None
         input_path = args.input or (str(folder / "data") if folder else None)
