@@ -597,7 +597,19 @@ def run_nvr(args):
             for _, job in jobs:
                 job.pbar_update = pbar.update
                 job.start()
-            det.run(q, len(jobs))
+            # Sightings are rebuilt after every chunk anyway; also rebuild (throttled)
+            # as soon as a Hit lands, so the Sighting Wall shows it without
+            # waiting for the rest of the chunk
+            dirty, last = set(), [0.0]
+
+            def flush():
+                if dirty and time.time() - last[0] >= LIVE_FLUSH_S:
+                    for cam_id in list(dirty):
+                        stores[cam_id].write_outputs(args.gap)
+                    dirty.clear()
+                    last[0] = time.time()
+
+            det.run(q, len(jobs), on_hits=lambda cam_id: (dirty.add(cam_id), flush()), idle=flush)
     finally:
         for cam in cams.values():
             cam.close()
