@@ -347,6 +347,8 @@ python sighting_wall.py
 - เวลาใน **live** ช้ากว่านาฬิกาบนภาพ ~4-8 วินาที (decode เฉพาะ keyframe ทำให้ได้เฟรมช้า
   ไปราว 1 รอบ keyframe) ย้อนหลังคลาด ~1 วินาที -- Sighting ยังรวมกันได้ด้วย gap 10 วินาที
 - กล้องที่ login ไม่ผ่าน/สตรีมหลุด ข้ามไป ไม่ลากกล้องอื่น; live reconnect เอง
+- `nvr` แสดงแถบรวม + แถบต่อกล้อง: `at` = เวลาในวิดีโอที่สแกนถึงล่าสุด, จำนวน Hit, และสถานะ
+  (downloading / waiting for NVR / retrying / done) -- ภาพขึ้น Sighting Wall ภายใน ~3 วินาทีหลังเจอ
 
 ## censor.py / select_region.py
 

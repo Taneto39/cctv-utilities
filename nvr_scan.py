@@ -65,6 +65,12 @@ DOWNLOAD_RETRIES = 3
 LIVE_FLUSH_S = 3.0
 
 
+def _log(msg):
+    """print() that doesn't tear the per-camera progress bars."""
+    from tqdm import tqdm
+    tqdm.write(msg)
+
+
 # --------------------------------------------------------------------------
 # Config: .env (NVR_SDK_DIR, NVR_SCAN_ROOT) and the shared nvr-sdk
 # --------------------------------------------------------------------------
@@ -93,6 +99,12 @@ def import_nvr():
     if sdk_dir not in sys.path:
         sys.path.insert(0, sdk_dir)
     import nvr
+    # the SDK wrappers print() their [DBG] lines; route them around the progress bars
+    for mod in ("hik_sdk", "dahua_sdk"):
+        try:
+            __import__(mod).print = _log
+        except Exception:  # SDK not installed / DLL missing: nvr.Camera reports it when used
+            pass
     return nvr
 
 
@@ -379,6 +391,7 @@ class Detector:
         self.imgsz = {}
         self.n_frames = 0
         self.n_hits = Counter()
+        self.last_t = {}     # cam_id -> wall-clock time of the latest keyframe run through the detector
         self.on_hits = None
         for cam_id, store in stores.items():
             self.imgsz[cam_id] = args.imgsz or (640 if store.region else 1280)
@@ -414,6 +427,7 @@ class Detector:
                     offs.append((0, 0))
             results = self.model.predict(imgs, imgsz=imgsz, conf=self.conf, classes=self.class_ids, verbose=False)
             for (_, cam_id, t, frame, src), (ox, oy), r in zip(items, offs, results):
+                self.last_t[cam_id] = t
                 if not len(r.boxes):
                     continue
                 store = self.stores[cam_id]
@@ -432,13 +446,16 @@ class Detector:
                     self.on_hits(cam_id)
         self.n_frames += len(batch)
 
-    def run(self, q, n_producers, on_hits=None, idle=None):
+    def run(self, q, n_producers, on_hits=None, idle=None, tick=None):
         """Consumes q until every producer has sent "done". `idle` (if given)
-        is called whenever the queue has been empty for a moment."""
+        is called whenever the queue has been empty for a moment; `tick`
+        (if given) after every item and when idle."""
         self.on_hits = on_hits
         remaining = n_producers
         batch = []
         while remaining > 0:
+            if tick:
+                tick()
             try:
                 item = q.get(timeout=0.5)
             except queue.Empty:
@@ -472,9 +489,12 @@ class NvrCameraJob:
     """Downloads one camera's chunks (a little ahead) and decodes their
     keyframes into the shared detector queue."""
 
-    def __init__(self, cam, store, chunks, q, args, stats, pbar_update):
+    def __init__(self, cam, store, chunks, q, args, stats):
         self.cam, self.store, self.chunks, self.q = cam, store, chunks, q
-        self.args, self.stats, self.pbar_update = args, stats, pbar_update
+        self.args, self.stats = args, stats
+        self.status = {"state": "starting"}   # set by the download thread, shown on the progress bar
+        self.bar = None
+        self.on_progress = None
         self.ready = queue.Queue(maxsize=args.prefetch)
         self.tmp = store.dir / ".chunks"
         self.tmp.mkdir(exist_ok=True)
@@ -489,21 +509,25 @@ class NvrCameraJob:
             # either direction: a chunk ending near "now" may not be fully recorded yet
             wait = _ts(ce) + SETTLE_S - _ts(datetime.now())
             if wait > 0:
-                print(f"[{self.store.cam_id}] waiting {wait:.0f}s for {ce:%H:%M:%S} to finish recording on the NVR")
+                self.status["state"] = f"waiting for NVR to finish recording {ce:%H:%M}"
                 time.sleep(wait)
             dst = self.tmp / f"{cs:%Y%m%d-%H%M%S}{ext}"
+            self.status["state"] = f"downloading {cs:%H:%M}-{ce:%H:%M}"
             result = False
             for attempt in range(DOWNLOAD_RETRIES + 1):
                 try:
                     result = self.cam.download(cs, ce, str(dst), timeout=self.args.chunk_timeout)
                 except Exception as e:  # SDK hiccup: retry like a failed download
-                    print(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
+                    _log(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
                     result = False
                 if result is not False:
                     break
                 if attempt < DOWNLOAD_RETRIES:
+                    self.status["state"] = f"retrying {cs:%H:%M} ({attempt + 1}/{DOWNLOAD_RETRIES})"
                     time.sleep(5 * 3 ** attempt)
+            self.status["state"] = "downloaded ahead, waiting for detector"
             self.ready.put((cs, ce, dst if result else None, result))
+        self.status["state"] = "all downloaded"
         self.ready.put(None)
 
     def _decode_all(self):
@@ -520,7 +544,7 @@ class NvrCameraJob:
                         for offset, frame in osc.iter_keyframes(path):
                             self.q.put(("frame", cam_id, cs + timedelta(seconds=offset), frame, "nvr"))
                     except Exception as e:
-                        print(f"[{cam_id}] decode {cs:%H:%M:%S} failed: {e}")
+                        _log(f"[{cam_id}] decode {cs:%H:%M:%S} failed: {e}")
                         ok = False
                     finally:
                         try:
@@ -542,7 +566,8 @@ class NvrCameraJob:
             self.store.mark_covered(cs, ce)
         else:
             st["failed"].append(f"{cs:%H:%M:%S}-{ce:%H:%M:%S}")
-        self.pbar_update((ce - cs).total_seconds())
+        if self.on_progress:
+            self.on_progress((ce - cs).total_seconds())
         self.store.write_outputs(self.args.gap)
 
 
@@ -585,32 +610,60 @@ def run_nvr(args):
         stats[cam_id]["skipped"] = len(chunks_all) - len(todo)
         total_s += sum((ce - cs).total_seconds() for cs, ce in todo)
         if todo:
-            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, None)))
+            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats)))
     print(f"[object-scan nvr] {len(cams)} camera(s), {args.direction} {lo:%Y-%m-%d %H:%M:%S} -> "
           f"{hi:%Y-%m-%d %H:%M:%S}, {len(chunks_all)} chunk(s) of {args.chunk_min} min each per camera"
           + "".join(f"\n  {c}: {stats[c]['skipped']} chunk(s) already scanned" for c in cams if stats[c]["skipped"]))
 
     t0 = time.time()
+    bars = []
     try:
-        with tqdm(total=round(total_s), unit="s", desc="footage", dynamic_ncols=True,
-                  bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f}s footage [{elapsed}<{remaining}]") as pbar:
-            for _, job in jobs:
-                job.pbar_update = pbar.update
-                job.start()
-            # Sightings are rebuilt after every chunk anyway; also rebuild (throttled)
-            # as soon as a Hit lands, so the Sighting Wall shows it without
-            # waiting for the rest of the chunk
-            dirty, last = set(), [0.0]
+        # one bar for everything, then one per camera showing how far into the
+        # footage it has got (wall-clock time of the last keyframe scanned)
+        width = max([len(c) for c in cams] + [3])
+        overall = tqdm(total=round(total_s), desc="all".ljust(width), dynamic_ncols=True, position=0,
+                       bar_format="{desc} {bar:20} {percentage:3.0f}% {n:.0f}/{total:.0f}s footage "
+                                  "[{elapsed}<{remaining}]")
+        bars.append(overall)
+        for i, (cam_id, job) in enumerate(jobs, start=1):
+            cam_s = sum((ce - cs).total_seconds() for cs, ce in job.chunks)
+            job.bar = tqdm(total=round(cam_s), desc=cam_id.ljust(width), dynamic_ncols=True, position=i,
+                           bar_format="{desc} {bar:20} {percentage:3.0f}% | {postfix[0]}", postfix=["at - | starting"])
+            bars.append(job.bar)
+            job.on_progress = (lambda bar: lambda sec: (bar.update(sec), overall.update(sec)))(job.bar)
+            job.start()
+        last_tick = [0.0]
 
-            def flush():
-                if dirty and time.time() - last[0] >= LIVE_FLUSH_S:
-                    for cam_id in list(dirty):
-                        stores[cam_id].write_outputs(args.gap)
-                    dirty.clear()
-                    last[0] = time.time()
+        def tick(force=False):
+            if not force and time.time() - last_tick[0] < 0.5:
+                return
+            last_tick[0] = time.time()
+            for cam_id, job in jobs:
+                at = det.last_t.get(cam_id)
+                at_s = f"at {at:%m-%d %H:%M:%S}" if at else "at -"
+                state = "done" if job.bar.n >= job.bar.total else job.status["state"]
+                # a list, not a str: tqdm would prefix a str postfix with ", "
+                job.bar.postfix = [f"{at_s} | hits {det.n_hits[cam_id]} | {state}"]
+                job.bar.refresh()
+            overall.refresh()
 
-            det.run(q, len(jobs), on_hits=lambda cam_id: (dirty.add(cam_id), flush()), idle=flush)
+        # Sightings are rebuilt after every chunk anyway; also rebuild (throttled)
+        # as soon as a Hit lands, so the Sighting Wall shows it without
+        # waiting for the rest of the chunk
+        dirty, last = set(), [0.0]
+
+        def flush():
+            if dirty and time.time() - last[0] >= LIVE_FLUSH_S:
+                for cam_id in list(dirty):
+                    stores[cam_id].write_outputs(args.gap)
+                dirty.clear()
+                last[0] = time.time()
+
+        det.run(q, len(jobs), on_hits=lambda cam_id: (dirty.add(cam_id), flush()), idle=flush, tick=tick)
+        tick(force=True)
     finally:
+        for bar in reversed(bars):
+            bar.close()
         for cam in cams.values():
             cam.close()
     elapsed = time.time() - t0
