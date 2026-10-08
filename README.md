@@ -202,9 +202,13 @@ Run `nvr` and `live` at the same time for "catch up, then keep watching".
 Results accumulate per camera under `<root>/<nvr>_ch<N>/sightings/`
 (`NVR_SCAN_ROOT` in `.env` or `--root`, default `./nvr_scans`).
 Already-scanned time is skipped on later runs; failed chunks are retried on
-the next run. Speed is network-bound -- NVRs send every frame, so
-keyframe-only download isn't possible. Live timestamps lag the burned-in
-clock by a few seconds.
+the next run. Speed is mostly network-bound. Dahua NVRs are asked for
+keyframes only (one SDK call per keyframe, one extra login per concurrent
+camera), which is about 1.5x faster than a full download on 4 cameras and
+gives each frame its exact recorded time; `--full-download` turns it off.
+Hikvision NVRs send every frame (no keyframe-only option was found in
+HCNetSDK, RTSP playback or ONVIF replay), so they always download in full.
+Live timestamps lag the burned-in clock by a few seconds.
 
 ## censor.py / select_region.py
 

@@ -34,7 +34,9 @@ Every camera gets one folder that accumulates every run (<root>/<nvr>_ch<N>/):
       .nvr_state.json      which stretches of recorded time are already scanned
 
 Recorded footage is downloaded in chunks aligned to a fixed wall-clock grid
-(default 5 min), scanned keyframe-by-keyframe, then deleted.
+(default 5 min), scanned keyframe-by-keyframe, then deleted. Dahua NVRs send
+the keyframes only (--full-download turns that off); Hikvision has no such
+option, so it downloads every frame.
 """
 import argparse
 import csv
@@ -42,6 +44,7 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -410,21 +413,25 @@ class Detector:
         return self.crops[cam_id]
 
     def _run_batch(self, batch):
-        # one predict() per imgsz (cameras with / without a Region differ)
-        by_size = {}
+        # one predict() per (imgsz, input size): ultralytics letterboxes a batch of
+        # mixed sizes to a square instead of each image's own rectangle, which
+        # changes detections (a 0.40 Hit vanished when a 2688x1520 frame shared a
+        # batch with 2560x1440 ones) -- so cameras of different resolutions, or
+        # with / without a Region, never share a predict() call
+        groups = {}
         for item in batch:
-            by_size.setdefault(self.imgsz[item[1]], []).append(item)
-        for imgsz, items in by_size.items():
-            imgs, offs = [], []
-            for _, cam_id, t, frame, src in items:
-                crop = self._crop(cam_id, frame)
-                if crop:
-                    x0, y0, x1, y1 = crop
-                    imgs.append(frame[y0:y1, x0:x1])
-                    offs.append((x0, y0))
-                else:
-                    imgs.append(frame)
-                    offs.append((0, 0))
+            _, cam_id, t, frame, src = item
+            crop = self._crop(cam_id, frame)
+            if crop:
+                x0, y0, x1, y1 = crop
+                img, off = frame[y0:y1, x0:x1], (x0, y0)
+            else:
+                img, off = frame, (0, 0)
+            g = groups.setdefault((self.imgsz[cam_id], img.shape[:2]), ([], [], []))
+            g[0].append(item)
+            g[1].append(img)
+            g[2].append(off)
+        for (imgsz, _), (items, imgs, offs) in groups.items():
             results = self.model.predict(imgs, imgsz=imgsz, conf=self.conf, classes=self.class_ids, verbose=False)
             for (_, cam_id, t, frame, src), (ox, oy), r in zip(items, offs, results):
                 self.last_t[cam_id] = t
@@ -498,6 +505,9 @@ class NvrCameraJob:
         self.ready = queue.Queue(maxsize=args.prefetch)
         self.tmp = store.dir / ".chunks"
         self.tmp.mkdir(exist_ok=True)
+        # Dahua can send I-frames only (DESIGN.md "Keyframe-only download"):
+        # same keyframes, ~2x fewer bytes, exact wall-clock time per frame
+        self.keyframes = getattr(cam, "supports_keyframes", False) and not args.full_download
 
     def start(self):
         threading.Thread(target=self._download_all, daemon=True).start()
@@ -512,11 +522,13 @@ class NvrCameraJob:
                 self.status["state"] = f"waiting for NVR to finish recording {ce:%H:%M}"
                 time.sleep(wait)
             dst = self.tmp / f"{cs:%Y%m%d-%H%M%S}{ext}"
-            self.status["state"] = f"downloading {cs:%H:%M}-{ce:%H:%M}"
+            what = "keyframes" if self.keyframes else "downloading"
+            self.status["state"] = f"{what} {cs:%H:%M}-{ce:%H:%M}"
+            fetch = self.cam.download_keyframes if self.keyframes else self.cam.download
             result = False
             for attempt in range(DOWNLOAD_RETRIES + 1):
                 try:
-                    result = self.cam.download(cs, ce, str(dst), timeout=self.args.chunk_timeout)
+                    result = fetch(cs, ce, str(dst), timeout=self.args.chunk_timeout)
                 except Exception as e:  # SDK hiccup: retry like a failed download
                     _log(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
                     result = False
@@ -525,8 +537,17 @@ class NvrCameraJob:
                 if attempt < DOWNLOAD_RETRIES:
                     self.status["state"] = f"retrying {cs:%H:%M} ({attempt + 1}/{DOWNLOAD_RETRIES})"
                     time.sleep(5 * 3 ** attempt)
+            # a keyframe-only file starts at the first keyframe >= cs, not at cs
+            base = cs
+            if result and self.keyframes:
+                import dahua_sdk  # on sys.path once nvr is imported
+                try:
+                    with open(dst, "rb") as f:
+                        base = dahua_sdk.dhav_time(f.read(24))
+                except (OSError, ValueError, struct.error) as e:
+                    _log(f"[{self.store.cam_id}] keyframe time {cs:%H:%M:%S} unreadable ({e}), using chunk start")
             self.status["state"] = "downloaded ahead, waiting for detector"
-            self.ready.put((cs, ce, dst if result else None, result))
+            self.ready.put((cs, ce, dst if result else None, result, base))
         self.status["state"] = "all downloaded"
         self.ready.put(None)
 
@@ -537,12 +558,12 @@ class NvrCameraJob:
                 item = self.ready.get()
                 if item is None:
                     break
-                cs, ce, path, result = item
+                cs, ce, path, result, base = item
                 ok = True
                 if path is not None:
                     try:
                         for offset, frame in osc.iter_keyframes(path):
-                            self.q.put(("frame", cam_id, cs + timedelta(seconds=offset), frame, "nvr"))
+                            self.q.put(("frame", cam_id, base + timedelta(seconds=offset), frame, "nvr"))
                     except Exception as e:
                         _log(f"[{cam_id}] decode {cs:%H:%M:%S} failed: {e}")
                         ok = False
@@ -833,6 +854,9 @@ def main(argv):
                    help="Max concurrent downloads per NVR (default 4; some NVRs error under more).")
     p.add_argument("--prefetch", type=int, default=2, help="Chunks downloaded ahead per camera (default 2).")
     p.add_argument("--chunk-timeout", type=int, default=300, help="Seconds before a chunk download is abandoned.")
+    p.add_argument("--full-download", action="store_true",
+                   help="Dahua: download full footage instead of fetching keyframes only (the default for "
+                        "Dahua; Hikvision always downloads full footage).")
     p.add_argument("--restart", action="store_true", help="Forget which stretches were already scanned.")
     _detector_args(p)
 
