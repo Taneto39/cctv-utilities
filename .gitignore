@@ -33,3 +33,6 @@ DESIGN.md
 PROGRESS.md
 # per-machine paths (NVR_SDK_DIR) -- see .env.example
 .env
+
+# personal Thai README (real paths, site notes) -- see ~/.claude/CLAUDE.md
+README-full.md
