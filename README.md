@@ -259,7 +259,96 @@ python object_scan.py --input "data/cat" --gap 30
   ถ้าไฟล์ต่อกันจริง (ตรวจช่องว่างให้)
 - ถอดรหัสด้วย NVDEC (`-hwaccel cuda`) -- สำหรับ keyframe อย่างเดียว เร็วกว่า
   CPU ~3-4 เท่า (ตรงข้ามกับ `motion_scan.py` ที่ decode ทุกเฟรม)
-- ดึงจาก NVR ตรงๆ (ISAPI) ยังไม่ทำ มีแค่โครง (`IsapiSource`)
+
+### Target ที่ใช้ได้ (`--targets`)
+
+โมเดล default (`yolo26x.pt`) เทรนบน COCO รู้จัก 80 class นี้เท่านั้น (สะกดตามนี้เป๊ะ
+คั่นหลาย Target ด้วย `,` เช่น `--targets animal,person,car`) -- class นอกรายการนี้
+(เช่น งู, ตุ๊กแก) ตรวจไม่ได้ ต้องใช้โมเดลอื่น/เทรนเอง:
+
+| หมวด | class |
+|---|---|
+| คน/สัตว์ | `person`, `bird`, `cat`, `dog`, `horse`, `sheep`, `cow`, `elephant`, `bear`, `zebra`, `giraffe` |
+| ยานพาหนะ | `bicycle`, `car`, `motorcycle`, `airplane`, `bus`, `train`, `truck`, `boat` |
+| ถนน | `traffic light`, `fire hydrant`, `stop sign`, `parking meter`, `bench` |
+| ของติดตัว | `backpack`, `umbrella`, `handbag`, `tie`, `suitcase` |
+| กีฬา | `frisbee`, `skis`, `snowboard`, `sports ball`, `kite`, `baseball bat`, `baseball glove`, `skateboard`, `surfboard`, `tennis racket` |
+| ครัว/อาหาร | `bottle`, `wine glass`, `cup`, `fork`, `knife`, `spoon`, `bowl`, `banana`, `apple`, `sandwich`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake` |
+| เฟอร์นิเจอร์/เครื่องใช้ | `chair`, `couch`, `potted plant`, `bed`, `dining table`, `toilet`, `tv`, `laptop`, `mouse`, `remote`, `keyboard`, `cell phone`, `microwave`, `oven`, `toaster`, `sink`, `refrigerator` |
+| อื่นๆ | `book`, `clock`, `vase`, `scissors`, `teddy bear`, `hair drier`, `toothbrush` |
+
+กลุ่ม (นับหลาย class เป็น Target เดียว, แก้/เพิ่มได้ที่ `CLASS_GROUPS` ใน `object_scan.py`):
+- `animal` = `cat` + `dog` (default) -- แมวตัวเล็กในกล้องวงจรปิดมักถูกทายเป็น `dog`
+
+class ที่มีช่องว่างต้องใส่เครื่องหมายคำพูดทั้งก้อน เช่น `--targets "person,cell phone"`
+ถ้าพิมพ์ชื่อผิด/ไม่มีในโมเดล โปรแกรมจะหยุดพร้อมบอกชื่อที่ไม่รู้จัก
+
+**ทำไม default เป็น `yolo26x.pt` ไม่ใช่ `yolo11x.pt`** (เทียบ 2026-10-08, ความเร็วเท่ากัน):
+- `data/cata5` (แมวขาวดำตัวเล็ก กลางคืน): yolo11x ทายแมวตัวเดียวกันว่า `person` 4 ช่วง
+  ทำให้ `--targets animal` เจอแค่ 7 keyframe; yolo26x ทายเป็น `dog` ทุกครั้ง (อยู่ใน `animal`)
+  เจอ 18 keyframe ครอบคลุม 01:48-01:51 ต่อเนื่องกว่ามาก
+- กล้องจริง 30 นาที (Hik ห้อง รปภ. + Dahua ทางออก): yolo11x มี `dog 0.68` ที่จริงเป็นคนก้มตัว
+  yolo26x ไม่มี; คนเกือบทุกช่วงตรงกัน yolo26x พลาดคนที่ชิดกล้องจนเห็นแค่ขา 1 ครั้ง
+
+เปลี่ยนโมเดลด้วย `--model` (เช่น `--model yolo11x.pt` -- ultralytics ดาวน์โหลดให้เองครั้งแรก)
+โมเดล YOLO ตระกูล COCO ใช้ชื่อ class ชุดเดียวกันนี้ เปลี่ยนโมเดลแล้วผลเดิมจะถูกสแกนใหม่
+(โมเดลเป็นส่วนหนึ่งของสิ่งที่ตัดสินว่าอะไรนับเป็น Hit) และ `--conf` ที่เหมาะอาจต่างไป
+
+### ดึงจาก NVR ตรงๆ (Hikvision / Dahua) + Live Watch + Sighting Wall
+
+ไม่ต้อง export ไฟล์เอง -- โหลดจาก NVR เป็นก้อน (default 5 นาที) ผ่าน SDK ของแต่ละยี่ห้อ
+สแกนแล้วลบทิ้งทันที เก็บไว้แค่ผลลัพธ์ (ทำไมใช้ SDK ไม่ใช่ ISAPI: [ADR 0003](docs/adr/0003-nvr-source-uses-vendor-sdks.md))
+
+เตรียมครั้งเดียว:
+- SDK อยู่ที่โฟลเดอร์กลาง `D:/Github/for_UJP/nvr-sdk` (ใช้ร่วมกับ project อื่น) -- ตั้ง path ใน `.env`
+  ของ repo นี้ (ดู `.env.example`): `NVR_SDK_DIR=D:/Github/for_UJP/nvr-sdk`
+- Dahua: `pip install D:/Github/for_UJP/nvr-sdk/dahua/NetSDK-2.0.0.1-py3-none-win_amd64.whl`
+- รายชื่อ NVR + user/password อยู่ใน `nvr-sdk/nvrs.env` (copy จาก `nvrs.env.example`)
+- ทดสอบ: `python D:/Github/for_UJP/nvr-sdk/nvr.py test hik1:3`
+- Windows เท่านั้น (SDK เป็น DLL ของ Windows)
+
+กล้องระบุเป็น `<ชื่อ NVR>:<เลขกล้องบนจอ NVR>` เช่น `hik1:3` คั่นด้วย `,` ได้หลายกล้อง
+ทุกกล้องใช้โมเดลตัวเดียวกัน (8 กล้องพร้อมกันไม่กิน VRAM 8 เท่า)
+
+```bash
+# ย้อนหลัง: จากเวลานี้ "ไปข้างหน้า" จนถึงตอนกดรัน แล้วจบเอง (hh:mm:ss = วันนี้ หรือใส่วันเต็ม)
+python object_scan.py nvr --camera hik1:3,dahua1:1 --from 09:00:00
+python object_scan.py nvr --camera hik1:3 --from "2026-10-07 22:00:00"
+
+# ย้อนหลัง: จากเวลานี้ "ถอยหลัง" (ใหม่ไปเก่า เจอล่าสุดก่อน) ไป --end (default 1h)
+python object_scan.py nvr --camera hik1:3 --from 10:00:00 --direction backward --end 3h
+
+# สด: หลายกล้อง, Ctrl+C หยุด
+python object_scan.py live --camera hik1:3,dahua1:1
+
+# เลือก Region จากภาพสดของกล้อง (เก็บที่ <root>/<กล้อง>/region.json)
+python object_scan.py select-region --camera hik1:3
+
+# จอ 2x2 แสดง Sighting ที่เจอ วน 1>2>3>4>1 (q/Esc ปิด, f เต็มจอ)
+python sighting_wall.py
+```
+
+"ย้อนหลังจนถึงตอนนี้ แล้วดูสดต่อ" = เปิด `nvr` กับ `live` **พร้อมกัน** (คนละหน้าต่าง)
+`nvr` สแกนถึงเวลาที่กดรันแล้วจบเอง `live` ดูต่อจากนั้น ไม่มีช่องว่าง
+
+ผลลัพธ์อยู่ที่ `<root>/<nvr>_ch<N>/sightings/` (root = `NVR_SCAN_ROOT` ใน `.env` หรือ
+`--root`, default `./nvr_scans`) -- **หนึ่งโฟลเดอร์ต่อกล้อง สะสมทุกครั้งที่รัน** (ย้อนหลัง/สด):
+`sightings.csv` (มีคอลัมน์ `source` = nvr / live / nvr+live), `images/`, `frames/`
+(keyframe ที่มี Hit -- ภาพ Sighting วาดจากนี่ เพราะวิดีโอถูกลบแล้ว), `hits_nvr.jsonl`,
+`hits_live.jsonl`
+
+ข้อควรรู้:
+- **ช่วงเวลาที่สแกนแล้วไม่สแกนซ้ำ** (ถ้าตั้งค่าเดิม) -- ก้อนวิดีโอตัดตาม grid นาฬิกาคงที่
+  (00, 05, 10, ...) จำไว้ใน `.nvr_state.json`; `--restart` บังคับสแกนใหม่ (Hit เก่าย้ายไป `.bak`)
+- ก้อนที่โหลดไม่สำเร็จ (retry 3 ครั้งแล้ว) จะไม่ถูกจดว่าสแกนแล้ว -- รันซ้ำเพื่อลองใหม่
+- `--connections` (default 4) จำกัดการโหลดพร้อมกันต่อ NVR (Hik บางตัว error 10 ถ้าเยอะ)
+- ก้อนที่จบใกล้ "ตอนนี้" ไม่ถึง 90 วินาที จะรอให้ NVR บันทึกเสร็จก่อนค่อยโหลด
+- ความเร็วขึ้นกับเน็ตล้วนๆ (2026-10-08 วัดได้ 10-70x realtime ต่อกล้องแล้วแต่ช่วงเวลา) -- โหลดเฉพาะ keyframe ไม่ได้: NVR Hik ส่งมาครบทุกเฟรมทั้งแบบ download และ playback 16x
+- เวลาใน **live** ช้ากว่านาฬิกาบนภาพ ~4-8 วินาที (decode เฉพาะ keyframe ทำให้ได้เฟรมช้า
+  ไปราว 1 รอบ keyframe) ย้อนหลังคลาด ~1 วินาที -- Sighting ยังรวมกันได้ด้วย gap 10 วินาที
+- กล้องที่ login ไม่ผ่าน/สตรีมหลุด ข้ามไป ไม่ลากกล้องอื่น; live reconnect เอง
+- `nvr` แสดงแถบรวม + แถบต่อกล้อง: `at` = เวลาในวิดีโอที่สแกนถึงล่าสุด, จำนวน Hit, และสถานะ
+  (downloading / waiting for NVR / retrying / done) -- ภาพขึ้น Sighting Wall ภายใน ~3 วินาทีหลังเจอ
 
 ## censor.py / select_region.py
 

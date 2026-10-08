@@ -31,6 +31,10 @@ Usage:
     # since gap isn't part of what decides a Hit:
     python object_scan.py --input "data/cat" --gap 30
 
+    # Straight from Hikvision/Dahua NVRs, or live (see nvr_scan.py):
+    python object_scan.py nvr --camera hik1:3 --from 09:00:00
+    python object_scan.py live --camera hik1:3,dahua1:1
+
 Output (<output>/):
     sightings.csv   one row per Sighting, rebuilt after every recording
     images/         one JPEG per Sighting: the best-confidence keyframe, with
@@ -138,12 +142,17 @@ def probe_duration(path):
         return None
 
 
-def probe_size(path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+def probe_size(path, input_args=()):
+    out = subprocess.run(["ffprobe", "-v", "error", *input_args, "-select_streams", "v:0", "-show_entries",
                           "stream=width,height", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True).stdout.strip()
-    w, h = out.split(",")[:2]
-    return int(w), int(h)
+    try:
+        w, h = out.split(",")[:2]
+        return int(w), int(h)
+    except ValueError:
+        # no path in the message: for Live Watch it's an RTSP URL with the password in it
+        raise RuntimeError("ffprobe found no video stream (unreachable stream, wrong password, "
+                           "or not a video file)") from None
 
 
 # --------------------------------------------------------------------------
@@ -153,7 +162,7 @@ def probe_size(path):
 _SHOWINFO_RE = re.compile(r"\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:(-?[\d.]+)")
 
 
-def iter_keyframes(path):
+def iter_keyframes(path, input_args=()):
     """Yields (offset_seconds, bgr_frame) for every keyframe of a recording.
 
     Decodes with ffmpeg `-skip_frame nokey` and NVDEC (`-hwaccel cuda`,
@@ -164,11 +173,13 @@ def iter_keyframes(path):
     HEVC on the dev machine). Offsets come from ffmpeg's `showinfo` filter on
     stderr, so they're in ffmpeg's start-normalised timebase (first frame =
     0) regardless of the container's raw PTS (these PS exports start at
-    e.g. 11244s), and line up 1:1 with frames on stdout."""
-    w, h = probe_size(path)
+    e.g. 11244s), and line up 1:1 with frames on stdout. `path` can also be
+    a stream URL (Live Watch), with e.g. `-rtsp_transport tcp` in
+    input_args."""
+    w, h = probe_size(path, input_args)
     frame_bytes = w * h * 3
     cmd = ["ffmpeg", "-hide_banner", "-nostats", "-v", "info", "-hwaccel", "cuda",
-           "-skip_frame", "nokey", "-i", str(path), "-an", "-sn", "-vf", "showinfo",
+           "-skip_frame", "nokey", *input_args, "-i", str(path), "-an", "-sn", "-vf", "showinfo",
            "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     pts_q = queue.Queue()
@@ -207,22 +218,6 @@ def grab_keyframe(path, offset):
     if not out:
         return None
     return cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
-
-
-class IsapiSource:
-    """Placeholder for the NVR source: recorded footage for a camera + time
-    range, pulled straight from a Hikvision NVR over ISAPI
-    (`/ISAPI/ContentMgmt/search` to find recordings, then
-    `/ISAPI/ContentMgmt/download` with the playbackURI, streamed into
-    ffmpeg's stdin instead of a file) and fed through the same keyframe ->
-    Hit pipeline, with nothing stored on disk but the results. ISAPI rather
-    than RTSP playback because RTSP playback typically runs at real-time
-    (1x) speed, while download runs at network speed. Not implemented yet --
-    not verified against the real NVR."""
-
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("NVR source (ISAPI) isn't implemented yet -- "
-                                  "use downloaded recordings via --folder/--input.")
 
 
 # --------------------------------------------------------------------------
@@ -582,7 +577,9 @@ def main():
                         help=f"Max seconds between Hits merged into one Sighting. Default {DEFAULT_GAP_S:g}. "
                              "Changing it regroups existing Hits without re-scanning.")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--model", default="yolo11x.pt")
+    parser.add_argument("--model", default="yolo26x.pt",
+                        help="Default yolo26x.pt -- found the small cat far more reliably than yolo11x.pt "
+                             "(which labelled it \"person\"), see DESIGN.md.")
     parser.add_argument("--restart", action="store_true", help="Ignore saved progress and re-scan everything.")
     args = parser.parse_args()
 
@@ -673,4 +670,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] in ("nvr", "live", "select-region"):
+        import nvr_scan  # NVR source + Live Watch (needs nvr-sdk, see .env.example)
+        nvr_scan.main(sys.argv[1:])
+    else:
+        main()

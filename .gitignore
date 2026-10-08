@@ -10,6 +10,7 @@ output/
 output_h265/
 output_h264/
 output_h264_pipeline/
+nvr_scans/
 *.mp4
 *.avi
 *.mkv
@@ -30,3 +31,5 @@ CLAUDE.md
 CONTEXT.md
 DESIGN.md
 PROGRESS.md
+# per-machine paths (NVR_SDK_DIR) -- see .env.example
+.env
