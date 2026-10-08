@@ -260,6 +260,33 @@ python object_scan.py --input "data/cat" --gap 30
 - ถอดรหัสด้วย NVDEC (`-hwaccel cuda`) -- สำหรับ keyframe อย่างเดียว เร็วกว่า
   CPU ~3-4 เท่า (ตรงข้ามกับ `motion_scan.py` ที่ decode ทุกเฟรม)
 
+### Target ที่ใช้ได้ (`--targets`)
+
+โมเดล default (`yolo11x.pt`) เทรนบน COCO รู้จัก 80 class นี้เท่านั้น (สะกดตามนี้เป๊ะ
+คั่นหลาย Target ด้วย `,` เช่น `--targets animal,person,car`) -- class นอกรายการนี้
+(เช่น งู, ตุ๊กแก) ตรวจไม่ได้ ต้องใช้โมเดลอื่น/เทรนเอง:
+
+| หมวด | class |
+|---|---|
+| คน/สัตว์ | `person`, `bird`, `cat`, `dog`, `horse`, `sheep`, `cow`, `elephant`, `bear`, `zebra`, `giraffe` |
+| ยานพาหนะ | `bicycle`, `car`, `motorcycle`, `airplane`, `bus`, `train`, `truck`, `boat` |
+| ถนน | `traffic light`, `fire hydrant`, `stop sign`, `parking meter`, `bench` |
+| ของติดตัว | `backpack`, `umbrella`, `handbag`, `tie`, `suitcase` |
+| กีฬา | `frisbee`, `skis`, `snowboard`, `sports ball`, `kite`, `baseball bat`, `baseball glove`, `skateboard`, `surfboard`, `tennis racket` |
+| ครัว/อาหาร | `bottle`, `wine glass`, `cup`, `fork`, `knife`, `spoon`, `bowl`, `banana`, `apple`, `sandwich`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake` |
+| เฟอร์นิเจอร์/เครื่องใช้ | `chair`, `couch`, `potted plant`, `bed`, `dining table`, `toilet`, `tv`, `laptop`, `mouse`, `remote`, `keyboard`, `cell phone`, `microwave`, `oven`, `toaster`, `sink`, `refrigerator` |
+| อื่นๆ | `book`, `clock`, `vase`, `scissors`, `teddy bear`, `hair drier`, `toothbrush` |
+
+กลุ่ม (นับหลาย class เป็น Target เดียว, แก้/เพิ่มได้ที่ `CLASS_GROUPS` ใน `object_scan.py`):
+- `animal` = `cat` + `dog` (default) -- แมวตัวเล็กในกล้องวงจรปิดมักถูกทายเป็น `dog`
+
+class ที่มีช่องว่างต้องใส่เครื่องหมายคำพูดทั้งก้อน เช่น `--targets "person,cell phone"`
+ถ้าพิมพ์ชื่อผิด/ไม่มีในโมเดล โปรแกรมจะหยุดพร้อมบอกชื่อที่ไม่รู้จัก
+
+เปลี่ยนโมเดลด้วย `--model` (เช่น `--model yolo26x.pt` -- ultralytics ดาวน์โหลดให้เองครั้งแรก)
+โมเดล YOLO ตระกูล COCO ใช้ชื่อ class ชุดเดียวกันนี้ เปลี่ยนโมเดลแล้วผลเดิมจะถูกสแกนใหม่
+(โมเดลเป็นส่วนหนึ่งของสิ่งที่ตัดสินว่าอะไรนับเป็น Hit) และ `--conf` ที่เหมาะอาจต่างไป
+
 ### ดึงจาก NVR ตรงๆ (Hikvision / Dahua) + Live Watch + Sighting Wall
 
 ไม่ต้อง export ไฟล์เอง -- โหลดจาก NVR เป็นก้อน (default 5 นาที) ผ่าน SDK ของแต่ละยี่ห้อ
