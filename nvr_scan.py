@@ -747,7 +747,7 @@ def _detector_args(p):
     p.add_argument("--gap", type=float, default=osc.DEFAULT_GAP_S,
                    help="Max seconds between Hits merged into one Sighting.")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--model", default="yolo11x.pt")
+    p.add_argument("--model", default="yolo26x.pt", help="Default yolo26x.pt (see DESIGN.md).")
 
 
 def main(argv):

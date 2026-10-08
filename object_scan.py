@@ -577,7 +577,9 @@ def main():
                         help=f"Max seconds between Hits merged into one Sighting. Default {DEFAULT_GAP_S:g}. "
                              "Changing it regroups existing Hits without re-scanning.")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--model", default="yolo11x.pt")
+    parser.add_argument("--model", default="yolo26x.pt",
+                        help="Default yolo26x.pt -- found the small cat far more reliably than yolo11x.pt "
+                             "(which labelled it \"person\"), see DESIGN.md.")
     parser.add_argument("--restart", action="store_true", help="Ignore saved progress and re-scan everything.")
     args = parser.parse_args()
 
