@@ -10,6 +10,7 @@ output/
 output_h265/
 output_h264/
 output_h264_pipeline/
+nvr_scans/
 *.mp4
 *.avi
 *.mkv
