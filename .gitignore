@@ -30,3 +30,5 @@ CLAUDE.md
 CONTEXT.md
 DESIGN.md
 PROGRESS.md
+# per-machine paths (NVR_SDK_DIR) -- see .env.example
+.env

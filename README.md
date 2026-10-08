@@ -259,7 +259,60 @@ python object_scan.py --input "data/cat" --gap 30
   ถ้าไฟล์ต่อกันจริง (ตรวจช่องว่างให้)
 - ถอดรหัสด้วย NVDEC (`-hwaccel cuda`) -- สำหรับ keyframe อย่างเดียว เร็วกว่า
   CPU ~3-4 เท่า (ตรงข้ามกับ `motion_scan.py` ที่ decode ทุกเฟรม)
-- ดึงจาก NVR ตรงๆ (ISAPI) ยังไม่ทำ มีแค่โครง (`IsapiSource`)
+
+### ดึงจาก NVR ตรงๆ (Hikvision / Dahua) + Live Watch + Sighting Wall
+
+ไม่ต้อง export ไฟล์เอง -- โหลดจาก NVR เป็นก้อน (default 5 นาที) ผ่าน SDK ของแต่ละยี่ห้อ
+สแกนแล้วลบทิ้งทันที เก็บไว้แค่ผลลัพธ์ (ทำไมใช้ SDK ไม่ใช่ ISAPI: [ADR 0003](docs/adr/0003-nvr-source-uses-vendor-sdks.md))
+
+เตรียมครั้งเดียว:
+- SDK อยู่ที่โฟลเดอร์กลาง `D:/Github/for_UJP/nvr-sdk` (ใช้ร่วมกับ project อื่น) -- ตั้ง path ใน `.env`
+  ของ repo นี้ (ดู `.env.example`): `NVR_SDK_DIR=D:/Github/for_UJP/nvr-sdk`
+- Dahua: `pip install D:/Github/for_UJP/nvr-sdk/dahua/NetSDK-2.0.0.1-py3-none-win_amd64.whl`
+- รายชื่อ NVR + user/password อยู่ใน `nvr-sdk/nvrs.env` (copy จาก `nvrs.env.example`)
+- ทดสอบ: `python D:/Github/for_UJP/nvr-sdk/nvr.py test hik1:3`
+- Windows เท่านั้น (SDK เป็น DLL ของ Windows)
+
+กล้องระบุเป็น `<ชื่อ NVR>:<เลขกล้องบนจอ NVR>` เช่น `hik1:3` คั่นด้วย `,` ได้หลายกล้อง
+ทุกกล้องใช้โมเดลตัวเดียวกัน (8 กล้องพร้อมกันไม่กิน VRAM 8 เท่า)
+
+```bash
+# ย้อนหลัง: จากเวลานี้ "ไปข้างหน้า" จนถึงตอนกดรัน แล้วจบเอง (hh:mm:ss = วันนี้ หรือใส่วันเต็ม)
+python object_scan.py nvr --camera hik1:3,dahua1:1 --from 09:00:00
+python object_scan.py nvr --camera hik1:3 --from "2026-10-07 22:00:00"
+
+# ย้อนหลัง: จากเวลานี้ "ถอยหลัง" (ใหม่ไปเก่า เจอล่าสุดก่อน) ไป --end (default 1h)
+python object_scan.py nvr --camera hik1:3 --from 10:00:00 --direction backward --end 3h
+
+# สด: หลายกล้อง, Ctrl+C หยุด
+python object_scan.py live --camera hik1:3,dahua1:1
+
+# เลือก Region จากภาพสดของกล้อง (เก็บที่ <root>/<กล้อง>/region.json)
+python object_scan.py select-region --camera hik1:3
+
+# จอ 2x2 แสดง Sighting ที่เจอ วน 1>2>3>4>1 (q/Esc ปิด, f เต็มจอ)
+python sighting_wall.py
+```
+
+"ย้อนหลังจนถึงตอนนี้ แล้วดูสดต่อ" = เปิด `nvr` กับ `live` **พร้อมกัน** (คนละหน้าต่าง)
+`nvr` สแกนถึงเวลาที่กดรันแล้วจบเอง `live` ดูต่อจากนั้น ไม่มีช่องว่าง
+
+ผลลัพธ์อยู่ที่ `<root>/<nvr>_ch<N>/sightings/` (root = `NVR_SCAN_ROOT` ใน `.env` หรือ
+`--root`, default `./nvr_scans`) -- **หนึ่งโฟลเดอร์ต่อกล้อง สะสมทุกครั้งที่รัน** (ย้อนหลัง/สด):
+`sightings.csv` (มีคอลัมน์ `source` = nvr / live / nvr+live), `images/`, `frames/`
+(keyframe ที่มี Hit -- ภาพ Sighting วาดจากนี่ เพราะวิดีโอถูกลบแล้ว), `hits_nvr.jsonl`,
+`hits_live.jsonl`
+
+ข้อควรรู้:
+- **ช่วงเวลาที่สแกนแล้วไม่สแกนซ้ำ** (ถ้าตั้งค่าเดิม) -- ก้อนวิดีโอตัดตาม grid นาฬิกาคงที่
+  (00, 05, 10, ...) จำไว้ใน `.nvr_state.json`; `--restart` บังคับสแกนใหม่ (Hit เก่าย้ายไป `.bak`)
+- ก้อนที่โหลดไม่สำเร็จ (retry 3 ครั้งแล้ว) จะไม่ถูกจดว่าสแกนแล้ว -- รันซ้ำเพื่อลองใหม่
+- `--connections` (default 4) จำกัดการโหลดพร้อมกันต่อ NVR (Hik บางตัว error 10 ถ้าเยอะ)
+- ก้อนที่จบใกล้ "ตอนนี้" ไม่ถึง 90 วินาที จะรอให้ NVR บันทึกเสร็จก่อนค่อยโหลด
+- ความเร็วจริง (2026-10-08): โหลด 1 กล้อง ~10-12x realtime; 2 กล้องพร้อมกันรวม ~23x
+- เวลาใน **live** ช้ากว่านาฬิกาบนภาพ ~4-8 วินาที (decode เฉพาะ keyframe ทำให้ได้เฟรมช้า
+  ไปราว 1 รอบ keyframe) ย้อนหลังคลาด ~1 วินาที -- Sighting ยังรวมกันได้ด้วย gap 10 วินาที
+- กล้องที่ login ไม่ผ่าน/สตรีมหลุด ข้ามไป ไม่ลากกล้องอื่น; live reconnect เอง
 
 ## censor.py / select_region.py
 
