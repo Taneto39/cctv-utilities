@@ -128,7 +128,7 @@ def censor_clip(src_path, out_path, points, effect="black", sigma=DEFAULT_BLUR_S
     progress_cb(frames_done, frames_total) is called periodically if given."""
     cap = cv2.VideoCapture(str(src_path))
     if not cap.isOpened():
-        return False, "ไม่สามารถเปิดไฟล์วิดีโอได้"
+        return False, "could not open video file"
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -227,7 +227,7 @@ def _censor_one(src_path, out_dir, points, force, effect, sigma, gpu_blur, progr
     resolution, disk hiccup, whatever) must not crash the whole batch."""
     out_path = out_dir / src_path.name
     if out_path.exists() and not force:
-        return out_path.name, None, "มีอยู่แล้ว ข้าม (--force เพื่อทำใหม่)"
+        return out_path.name, None, "already exists, skipped (--force to redo)"
     try:
         ok, reason = censor_clip(src_path, out_path, points, effect=effect, sigma=sigma,
                                  gpu_blur=gpu_blur, progress_cb=progress_cb)
@@ -294,7 +294,7 @@ def main():
     folder = Path(args.folder)
     region_path = Path(args.region) if args.region else folder / "region.json"
     if not region_path.is_file():
-        sys.exit(f"ไม่พบ {region_path} -- รัน select_region.py --folder \"{folder}\" ก่อน")
+        sys.exit(f"{region_path} not found -- run select_region.py --folder \"{folder}\" first")
 
     region = region_lib.load_region(region_path)
     points = region["points"]
@@ -308,7 +308,7 @@ def main():
 
     gpu_requested = args.gpu and args.effect == "blur"
     if gpu_requested and not torch_cuda_available():
-        print("[censor] --gpu ขอมา แต่ไม่พบ CUDA torch -- ใช้ CPU cv2.GaussianBlur แทน")
+        print("[censor] --gpu requested but no CUDA torch found -- falling back to CPU cv2.GaussianBlur")
     backend = "GPU (PyTorch CUDA)" if gpu_requested and torch_cuda_available() else "CPU"
     if args.effect == "blur":
         effect_desc = f"blur (sigma={args.blur_sigma}, {backend})"
@@ -316,7 +316,7 @@ def main():
         effect_desc = "crop (region bounding box)"
     else:
         effect_desc = "black fill"
-    print(f"พบ {len(clips)} ไฟล์   workers={workers}   effect={effect_desc}   output={out_dir}")
+    print(f"found {len(clips)} files   workers={workers}   effect={effect_desc}   output={out_dir}")
 
     # spawn, not the platform default (fork on Linux/macOS) -- torch CUDA is
     # already touched in this process by torch_cuda_available() above, and a
@@ -399,7 +399,7 @@ def main():
     for bar in worker_bars.values():
         bar.close()
 
-    print(f"เสร็จสิ้น  ทำแล้ว {done}  ข้าม {skipped}  ล้มเหลว {failed}")
+    print(f"finished  done {done}  skipped {skipped}  failed {failed}")
 
 
 if __name__ == "__main__":

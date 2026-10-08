@@ -35,13 +35,13 @@ with open(txt_file, encoding="utf-8") as f:
         if not match:
             continue
 
-        # timestamp แรกในบรรทัด
+        # first timestamp on the line
         timestamp = match.group()
 
-        # ส่วนก่อน timestamp
+        # everything before the timestamp
         prefix = line[:match.start()]
 
-        # ดึงเลขท้าย 17 หลัก
+        # trailing 17-digit file id
         file_id = re.search(
             r"(\d{17})$",
             prefix
@@ -68,7 +68,7 @@ with open(txt_file, encoding="utf-8") as f:
         )
 
 print(
-    f"พบรายการ {len(rename_list)} รายการ"
+    f"found {len(rename_list)} entries"
 )
 
 for old_name, new_name in rename_list:
