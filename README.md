@@ -170,9 +170,8 @@ The default model is `yolo26x.pt`; change it with `--model`.
 
 Downloads footage from the NVR in chunks (default 5 minutes) through the
 vendor SDKs, scans each chunk and deletes it, keeping only results. Windows
-only (the SDKs are Windows DLLs). See
-[ADR 0003](docs/adr/0003-nvr-source-uses-vendor-sdks.md) for why the SDKs
-are used instead of ISAPI.
+only (the SDKs are Windows DLLs). The vendor SDKs are used rather than
+ISAPI.
 
 Setup: put the SDK wrappers in a folder of your choice and point
 `NVR_SDK_DIR` at it in `.env` (see [.env.example](.env.example)); NVR

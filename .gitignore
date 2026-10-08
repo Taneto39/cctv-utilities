@@ -24,15 +24,8 @@ nvr_scans/
 # YOLO model weights -- large binaries, auto-downloaded/cached by ultralytics
 *.pt
 
-# docs for claude
-.claude/
+# local design notes
 docs/
-CLAUDE.md
-CONTEXT.md
-DESIGN.md
-PROGRESS.md
-# per-machine paths (NVR_SDK_DIR) -- see .env.example
-.env
 
-# personal Thai README (real paths, site notes) -- see ~/.claude/CLAUDE.md
-README-full.md
+# per-machine settings (NVR_SDK_DIR) -- see .env.example
+.env
