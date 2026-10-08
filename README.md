@@ -1,426 +1,257 @@
 # cctv-utilities
 
-รวมเครื่องมือสำหรับงานกล้องวงจรปิด/DVR ในที่เดียว ปัจจุบันมีสองกลุ่มหลัก:
-เครื่องมือดึงคลิปเหตุการณ์ที่มีการเคลื่อนไหว (motion-detection) ออกจาก
-ไฟล์วิดีโอที่ export มาจาก DVR/NVR (สไตล์ Hikvision ที่ตัดเป็นไฟล์ `.mp4`
-เล็กๆ ต่อกันหลายไฟล์ต่อวัน) และเครื่องมือชุดแยกต่างหากที่ไม่เกี่ยวข้องกัน
-(`censor.py` + `select_region.py`) สำหรับเบลอ/ปิดบังพื้นที่ส่วนตัวในโฟลเดอร์
-คลิปที่ตัดไว้แล้ว รวมถึงสคริปต์ช่วยเหลืออื่นๆ อีกเล็กน้อย -- โปรเจกต์นี้
-จะทยอยเพิ่มเครื่องมือ/ฟังก์ชันอื่นๆ ที่เกี่ยวกับ CCTV เข้ามาเรื่อยๆ ในอนาคต
-ไม่ได้จำกัดแค่สองกลุ่มนี้
+Tools for working with CCTV/DVR/NVR footage:
 
-## โครงสร้างไฟล์
+- **Motion scan** -- pull motion-event clips out of long DVR exports
+  (Hikvision-style, chained into many small `.mp4` segments per day).
+- **Clip filter** -- run YOLO over those clips and keep only the ones that
+  contain an object of interest (person/dog/cat by default).
+- **Object scan** -- run YOLO directly over raw footage (keyframes only) and
+  get wall-clock time ranges ("Sightings") when a target appears, from files
+  or straight from a Hikvision/Dahua NVR.
+- **Censor** -- privacy-blur/black-out a region in a folder of already-cut
+  clips.
+
+## Layout
 
 ```
-cctv-utilities/
-  motion_scan.py         สแกนหาการเคลื่อนไหว -- เลือกพื้นที่ตรวจจับก่อน แล้วค่อยสแกน
-  detect_objects.py      กรองคลิปที่ได้จาก motion_scan.py อีกชั้นด้วย YOLO object detection
-  object_scan.py         หาวัตถุ (แมว หมา คน รถ) จากฟุตเทจดิบโดยตรงด้วย YOLO -- ดูแค่ keyframe ได้รายการช่วงเวลา
-  select_region.py       UI เลือกพื้นที่ + รูปแบบไฟล์ region.json (ใช้ร่วมกับ censor.py)
-  censor.py              เบลอ/ปิดพื้นที่ส่วนตัวในโฟลเดอร์คลิปที่ตัดไว้แล้ว (แบบ flat)
-  rename_cctv_download.py เปลี่ยนชื่อไฟล์ที่ export จาก NVR ให้เรียงตามเวลาได้
-  bench_decord_gpu.py    เบนช์มาร์กทดสอบความเร็วถอดรหัส decord (GPU) เทียบกับ OpenCV (CPU)
-  requirements.txt       รายการไลบรารีที่ต้องติดตั้ง (pip install -r requirements.txt)
+motion_scan.py           motion detection: pick a region once, then scan
+detect_objects.py        second-pass YOLO filter over motion_scan.py's clips
+object_scan.py           YOLO over raw footage (keyframes) -> Sightings
+nvr_scan.py              NVR download / live-watch source for object_scan.py
+sighting_wall.py         2x2 viewer for Sightings as they arrive
+select_region.py         region picker UI + region.json format
+censor.py                blur/black-out/crop a region in a flat folder of clips
+rename_cctv_download.py  rename numeric NVR exports to sortable timestamps
+bench_decord_gpu.py      one-off decode benchmark (decord/NVDEC vs OpenCV)
+gcloud_billing_function/ Cloud Function that disables billing at a budget cap
 ```
 
-แต่ละ **โฟลเดอร์กล้อง** (เช่นโฟลเดอร์ export รายวัน หรือโฟลเดอร์ไหนก็ตามที่
-ชี้ให้ `motion_scan.py` ทำงานด้วย) จะเก็บทุกอย่างของตัวเองแยกกันชัดเจน:
+Each **camera folder** is self-contained:
 
 ```
 <folder>/
-  data/          ไฟล์วิดีโอต้นฉบับ
-  region.json    พื้นที่ตรวจจับ (สร้างครั้งเดียวตอน select-region)
-  output/        คลิปเหตุการณ์ที่ scan เขียนออกมา
+  data/          source footage
+  region.json    detection zone (created by select-region)
+  output/        event clips written by scan
 ```
 
-ไม่มี test suite, linter หรือ build step -- ทุกสคริปต์รันตรงๆ ด้วย `python`
-และต้องมี `ffmpeg`/`ffprobe` อยู่ใน PATH สำหรับงานที่เกี่ยวกับ codec
-(ถอดรหัสผ่าน NVDEC ถ้าเปิด `--nvdec`)
+No test suite or build step -- run the scripts directly with `python`.
+`ffmpeg`/`ffprobe` must be on `PATH`.
 
-## ติดตั้ง
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-ครอบคลุมทั้ง `motion_scan.py` และ `detect_objects.py` -- ถ้าต้องการแค่
-`motion_scan.py` อย่างเดียว มี `opencv-python numpy tqdm` ก็พอแล้ว (ดู
-คอมเมนต์ใน [requirements.txt](requirements.txt) รวมถึงวิธีติดตั้ง torch
-รุ่น CUDA ถ้าอยากลองทดสอบ `--gpu` ใหม่บนเครื่องอื่น)
+`motion_scan.py` alone only needs `opencv-python numpy tqdm`; see the
+comments in [requirements.txt](requirements.txt) for the optional CUDA torch
+install.
 
 ## motion_scan.py
 
-สแกนหาการเคลื่อนไหวในพื้นที่ที่เลือกไว้เอง (region) จากไฟล์วิดีโอที่ถูก
-ต่อกันเป็นสตรีมเดียว (ไฟล์ segment เล็กๆ ของ DVR จะถูกอ่านต่อเนื่องกัน เพื่อ
-ไม่ให้เหตุการณ์ที่คาบเกี่ยวรอยต่อไฟล์ถูกตัดขาด) ค่าเริ่มต้นประมวลผลด้วย CPU
-(OpenCV MOG2) -- ส่วน GPU compute (`--gpu`, PyTorch) และ GPU decode
-(`--nvdec`) มีให้ใช้แต่ปิดไว้เป็นค่าเริ่มต้นทั้งคู่ (เหตุผลอยู่ด้านล่าง)
-
-### วิธีใช้
-
 ```bash
-# 1. เลือกพื้นที่ตรวจจับครั้งเดียวต่อโฟลเดอร์กล้อง (คลิกจุด, คลิกขวาเพื่อ
-#    ยกเลิกจุดล่าสุด, กด N เพื่อปิดรูปทรงปัจจุบันแล้วเริ่มรูปใหม่ -- หลาย
-#    รูปทรงจะถูกรวมเป็นพื้นที่เดียว เช่น มีสองประตูในเฟรมเดียวกัน,
-#    Enter/S เพื่อบันทึก, Esc/Q เพื่อยกเลิก):
-python motion_scan.py select-region --folder "F:/cam1"
+# 1. Pick the detection zone once per camera folder. Click to add points,
+#    right-click to undo, N to close the current shape and start another
+#    (shapes are merged into one region), Enter/S to save, Esc/Q to cancel.
+python motion_scan.py select-region --folder /path/to/cam1
 
-# 2. สแกนทุกไฟล์ใน <folder>/data โดยใช้พื้นที่ที่บันทึกไว้:
-python motion_scan.py scan --folder "F:/cam1"
+# 2. Scan every file in <folder>/data, write clips to <folder>/output
+python motion_scan.py scan --folder /path/to/cam1 --workers 6
 ```
 
-ใช้ `--input` / `--region` / `--output` แทนค่าเริ่มต้นของ `--folder` ได้
-โดยตรง (เช่น อยากใช้ `region.json` เดียวกันกับหลายโฟลเดอร์กล้องที่มุมมอง
-เหมือนกัน)
+`--input` / `--region` / `--output` override the `--folder` defaults (e.g.
+to share one `region.json` across cameras with the same view).
 
-flag ที่ใช้บ่อยของ `scan`:
-
-| flag | ค่าเริ่มต้น | ทำอะไร |
+| flag | default | what it does |
 |---|---|---|
-| `--threshold` | 0.15 | สัดส่วนของพื้นที่ที่ต้องเป็น foreground ถึงจะนับว่ามีการเคลื่อนไหว |
-| `--min-event-len` | 1.0s | ต้องมีการเคลื่อนไหวต่อเนื่องนานแค่ไหนก่อนจะเริ่มตัดคลิป |
-| `--pre` / `--post` | 2.0s / 2.0s | ช่วงกันชนก่อน/หลังเหตุการณ์ที่เก็บไว้ในคลิป |
-| `--workers N` | `os.cpu_count()-1` | แบ่งไฟล์ไปประมวลผลแบบขนาน N โปรเซส (ข้อควรรู้: เหตุการณ์ที่คาบเกี่ยวรอยต่อของ worker อาจถูกตัดเป็นสองคลิป) ความเร็วจะเท่าเดิมหลังราว 6-10 workers แล้ว -- ค่าเริ่มต้น `cpu_count-1` ไม่ได้เร็วขึ้น แค่ใช้ทรัพยากรมากขึ้นโดยเปล่าประโยชน์ ลองกำหนด `--workers` เองให้อยู่ในช่วงนั้น |
-| `--gpu` | ปิด | เปลี่ยนไปใช้ GPU compute (PyTorch CUDA) แทน CPU/MOG2 -- ทดสอบแล้วช้ากว่า **และตรวจจับการเคลื่อนไหวตอนกลางคืน/IR ที่คอนทราสต์ต่ำไม่ได้เลย** ดูรายละเอียดด้านล่าง (`--no-gpu` ยังใช้ได้เพื่อความเข้ากันได้กับสคริปต์เก่า แต่เป็น no-op เพราะเป็นค่าเริ่มต้นอยู่แล้ว) |
-| `--nvdec` | ปิด | ลองใช้ GPU ถอดรหัสวิดีโอในทุก worker -- ดูหมายเหตุด้านล่าง |
-| `--nvdec-workers N` | 0 | ใช้ NVDEC ถอดรหัสเฉพาะ N โปรเซสจาก `--workers` ทั้งหมด (ที่เหลือใช้ CPU) สำหรับทดสอบการผสม CPU/GPU decode เท่านั้น ไม่แนะนำให้ใช้เป็นค่าเริ่มต้น |
-| `--dynamic` | ปิด | แจกงานจากคิวกลางแทนการแบ่งงานตายตัวล่วงหน้าให้แต่ละ worker -- ความเร็วเท่าเดิมถ้าใช้ CPU ล้วน แต่ช่วยได้บ้างเมื่อผสมกับ `--nvdec-workers` (ถึงจะยังช้ากว่าใช้ CPU ล้วนอยู่ดี) |
-| `--restart` | ปิด | ไม่สนใจความคืบหน้าที่บันทึกไว้จากรันก่อนหน้า เริ่มใหม่ทั้งหมด |
-| `--manifest-only` | ปิด | ไม่เขียนไฟล์คลิป แต่บันทึกเหตุการณ์ลง `<output>/events_manifest.jsonl` แทน แล้วค่อยใช้ `extract` มาตัดคลิปจริงทีหลัง (ดูหัวข้อ "สแกนบนคลาวด์" ด้านล่าง) |
-| `--note TEXT` | - | ข้อความกำกับที่จะถูกเก็บลง log ของรันนี้ เช่น `"c2d-32 pd-ssd 500GB"` เพื่อเทียบผลข้ามเครื่อง/ข้ามดิสก์ทีหลัง |
+| `--threshold` | 0.15 | fraction of the region that must be foreground to count as motion |
+| `--min-event-len` | 1.0s | how long motion must last before a clip starts |
+| `--pre` / `--post` | 2.0s / 2.0s | padding kept before/after each event |
+| `--workers N` | `cpu_count-1` | parallel processes. Throughput typically plateaus around 6-10; an event straddling two workers' chunks may be split into two clips |
+| `--gpu` | off | PyTorch CUDA motion detector instead of CPU/MOG2. Slower in testing **and misses low-contrast night/IR motion** -- don't use it on night footage |
+| `--nvdec` / `--nvdec-workers N` | off / 0 | GPU decode in all / N workers. Measured slower than CPU decode; kept for experiments |
+| `--dynamic` | off | hand out work from a shared queue instead of a fixed upfront split (only helps when mixing decode backends) |
+| `--restart` | off | ignore saved progress and start over |
+| `--manifest-only` | off | log events to `<output>/events_manifest.jsonl` instead of writing clips (see below) |
+| `--note TEXT` | - | label stored in this run's log entry |
 
-**Log การรัน:** ทุกครั้งที่รัน `scan` จะต่อท้าย `<output>/scan_runs.jsonl`
-(ไม่ถูกล้างโดย `--restart` หรือเมื่อรันจบ) ประกอบด้วยบรรทัด `start` (ค่าตั้งค่า, เครื่อง,
-จำนวน frame ที่ต้องทำ, `resumed` จริงหรือไม่), `checkpoint` ทุก 30 วินาที (frame ที่ main
-process ได้รับรายงาน + `queue_backlog` = ความลึกของคิวรายงานความคืบหน้า) และ `end`
-(`status`, เวลานาฬิกาจริง, `fps` = frame ทั้งหมด ÷ เวลาจริงของ invocation นั้น) รันที่ resume จะมี
-start/end แยกต่อ invocation โดยใช้ค่า `job` เดียวกัน ส่วนรันที่ถูกฆ่าแบบไม่มีโอกาสเก็บกวาด (เช่น
-spot VM โดนตัด) จะมี `start` แต่ไม่มี `end` ตัวเลข fps ตรงนี้เชื่อถือได้กว่าตัวเลขบน bar ของ tqdm
-ซึ่งเป็นค่าที่ถูก smooth และอาจค้างแล้วกระโดดถ้าคิวรายงานความคืบหน้าล้น ถ้า `queue_backlog` ใน
-checkpoint สูงหรือโตขึ้นเรื่อยๆ แปลว่า bar ช้ากว่าความเป็นจริง ไม่ใช่ worker ช้า
+**Resume:** an interrupted run (at `--workers 2` or more) resumes at segment
+granularity as long as the inputs and settings are unchanged (`--workers`
+itself may change).
 
-โดยปกติถ้าโปรแกรมพัง หรือถูกหยุดกลางทาง รันใหม่จะ resume ต่อจากเดิมได้เอง
-(ส่วนที่ทำเสร็จแล้วจะถูกข้าม ถ้า input/region/output/ค่าตั้งค่าต่างๆ ยังเหมือนเดิม
--- ยกเว้น `--workers` ที่ไม่นับรวมในการเช็คนี้โดยตั้งใจ เพราะเปลี่ยนจำนวน
-worker ไม่ได้ทำให้งานที่ทำอยู่เปลี่ยนไป)
+**Run log:** every `scan` appends `start` / `checkpoint` / `end` records to
+`<output>/scan_runs.jsonl`, including wall-clock `fps`. Use that for
+throughput numbers rather than the progress bars, which are smoothed.
 
-### สแกนบนคลาวด์: `--manifest-only` + `extract`
+### Scanning on a cloud VM: `--manifest-only` + `extract`
 
-การอัปโหลดไฟล์วิดีโอขึ้น VM เช่าไม่มีค่าใช้จ่าย (GCP/AWS/Azure ไม่คิดเงิน
-ขาเข้า) แต่การดาวน์โหลด *ผลลัพธ์* กลับมามีค่าใช้จ่าย (ประมาณ
-0.09-0.12 USD/GB ฝั่ง GCP เป็นต้น) ถ้าต้องดาวน์โหลดคลิปจริงกลับมาทั้งหมด
-ก็จะหมดประโยชน์ของการเช่าเครื่องมาสแกนไฟล์วิดีโอ 30-60GB ต่อวัน ดังนั้น
-`scan --manifest-only` จะข้ามการเขียนไฟล์คลิป แล้วบันทึกชื่อไฟล์ต้นทาง +
-ช่วงเฟรมของแต่ละเหตุการณ์ลง `<output>/events_manifest.jsonl` แทน
-(โดยทั่วไปมีขนาดแค่ไม่กี่ KB ไม่ว่าจะสแกนไฟล์วิดีโอมากแค่ไหน เพราะเป็น
-ข้อความล้วน ไม่ใช่วิดีโอ)
+Uploading footage to a cloud VM is usually free; downloading results is
+not. `--manifest-only` writes only a small JSONL manifest (source file names
++ frame ranges), which you download and then cut into real clips locally
+against your own copy of the footage:
 
 ```bash
-# บน cloud VM กับไฟล์วิดีโอที่อัปโหลดไว้:
-python motion_scan.py scan --folder "/mnt/cam1" --workers 8 --manifest-only
+# on the VM
+python motion_scan.py scan --folder /path/to/cam1 --workers 8 --manifest-only
 
-# ดาวน์โหลดแค่ events_manifest.jsonl (และ scan_runs.jsonl ถ้าอยากเก็บสถิติ
-# ความเร็ว) กลับมา -- ทั้งคู่แทบไม่มีค่า egress ห้ามดาวน์โหลดทั้งโฟลเดอร์ output/
-# หรือ data/ (pilot ปี 2026-09 เสียค่า egress 2.9 GiB ≈ 11 บาทจากพลาดตรงนี้)
-# หมายเหตุ: ลบไฟล์วิดีโอบน VM ไม่ช่วยลดค่าใช้จ่าย เพราะดิสก์คิดตามขนาดที่ตั้งไว้
-# ไม่ใช่ตามที่ใช้จริง -- ต้องลบทั้ง VM + ดิสก์ (ลบทิ้งเพื่อความเป็นส่วนตัวของ
-# ฟุตเทจก็ยังดี แต่ไม่ได้ประหยัดเงิน)
-
-# บนเครื่อง local กับไฟล์วิดีโอต้นฉบับตัวเดียวกัน (มีแค่สำเนาที่ถูกอัปโหลด
-# ไป ต้นฉบับไม่เคยออกจากเครื่อง local เลย) ตัดคลิปจริง:
-python motion_scan.py extract --folder "F:/cam1" --manifest "F:/cam1/output/events_manifest.jsonl"
-
-# ตัดหลายคลิปพร้อมกัน (ค่าเริ่มต้น --workers คือ os.cpu_count()-1 เหมือน scan):
-python motion_scan.py extract --folder "F:/cam1" --manifest "F:/cam1/output/events_manifest.jsonl" --workers 8
+# locally, after downloading events_manifest.jsonl
+python motion_scan.py extract --folder /path/to/cam1 \
+    --manifest /path/to/cam1/output/events_manifest.jsonl --workers 8
 ```
 
-`extract` จะอ่าน manifest แล้ว seek ไปตัดคลิปจริงจาก `data/` local
-โดยตรง -- ไม่ต้องรัน motion detection ซ้ำ จึงเบามาก (แค่ seek + copy
-ใช้วิธี seek แบบ warm-up GOP เดียวกับตอน scan) แต่ละ event ใน manifest
-เป็นงานอิสระต่อกัน (ไม่มีเงื่อนไขเรียงลำดับแบบ `scan --workers`) เลย
-`--workers` ของ `extract` แค่แจกงานทีละคลิปให้แต่ละ process ตรงๆ ไม่มี
-partition ซับซ้อน ชื่อไฟล์ใน manifest จะเป็น
-ชื่อเปล่าๆ (ไม่มี path ของโฟลเดอร์) โดยตั้งใจ เพื่อให้ manifest ที่สร้างจาก
-path แบบ Linux บน cloud VM ยังใช้กับ `--input` แบบ Windows บนเครื่อง local
-ได้ปกติ -- `extract` แค่เอาชื่อไฟล์ไปต่อกับ `--input` ของตัวเอง
-`--manifest-only` มีระบบ resume ระดับ segment เหมือน scan ปกติ (ถ้า spot
-VM ถูกตัดกลางทาง กลับมารันต่อได้โดยไม่เสียเหตุการณ์ที่เจอไปแล้ว รวมถึงไฟล์
-`events_manifest.jsonl` ด้วย)
-
-### ทำไม CPU ถึงเป็นค่าเริ่มต้น (ทั้ง `--gpu` และ `--nvdec` ปิดอยู่)
-
-`--nvdec` (ถอดรหัสวิดีโอด้วย GPU) ทดสอบแล้วพบว่า *ช้ากว่า* การถอดรหัสด้วย
-CPU (OpenCV) ธรรมดา เพราะต้นทุนการ copy ข้อมูลจาก GPU กลับมาที่ host
-กินความเร็วที่ควรจะได้จากการถอดรหัสไปหมด
-
-GPU *compute* (`--gpu`) ฟังดูน่าจะช่วยให้เร็วขึ้นเสมอ แต่จริงๆ เคยเป็นค่า
-เริ่มต้นมาก่อน แล้วถูกปรับลงเพราะสองเหตุผล:
-
-- **ช้ากว่า.** วัดผลจริงแล้วช้ากว่า CPU ทุกจำนวน worker ที่ทดสอบ -- แต่ละ
-  worker ต้องเปิด CUDA context ของตัวเอง แล้วเสียเวลา copy ข้อมูลจาก host
-  ไป device ทุกเฟรม ต้นทุนตรงนี้กินส่วนต่างที่ควรได้จาก compute เร็วกว่า
-  จนหมด
-- **มองไม่เห็นตอนกลางคืน.** ทดสอบกับไฟล์กลางคืน/IR จริง CPU/MOG2 เจอ
-  เหตุการณ์ 2 ครั้ง แต่ GPU เจอ 0 ครั้ง ตัวตรวจจับทั้งสองแบบ peak ที่เฟรม
-  เดียวกัน แต่ตัวตรวจจับฝั่ง GPU มีเกณฑ์ `diff > 4*std` ที่ต้องการการ
-  เปลี่ยนแปลงราว 24+ ระดับสี ในขณะที่ฉากกลางคืน/IR จริงมีการเปลี่ยนแปลง
-  แค่ราว 15-45 ระดับ ทำให้คะแนนต่ำกว่าเกณฑ์ที่ตั้งไว้ราว 200 เท่า -- เป็น
-  ข้อจำกัดของอัลกอริทึม ไม่ใช่ปัญหา driver/OS จึงพลาดเหตุการณ์แบบนี้ไม่ว่า
-  จะรันบนเครื่องไหนก็ตาม
-
-ความเร็วอาจต่างกันไปตามแต่ละเครื่อง แต่เรื่องมองไม่เห็นตอนกลางคืนเป็น
-ข้อจำกัดของตัว detector เอง -- อย่าใช้ `--gpu` กับไฟล์วิดีโอกลางคืน
+File names in the manifest are bare (no directory), so a manifest produced
+on Linux works against a Windows `--input` and vice versa. Deleting files on
+the VM doesn't reduce cost (disks bill by provisioned size) -- delete the VM
+and its disk when done.
 
 ## detect_objects.py
 
-ตัวกรองรอบสองต่อจากคลิปที่ `motion_scan.py` ผลิตออกมา: รันโมเดล YOLO
-(Ultralytics) กับแต่ละคลิป แล้วรายงานว่าคลิปไหนมีวัตถุที่สนใจจริงๆ
-(ค่าเริ่มต้น: person, dog, cat) จะได้ไม่ต้องมานั่งไล่ดูทุกคลิปที่ motion
-detection จับได้เองทั้งหมด คลิปที่ตรงเงื่อนไขจะถูกคัดลอก (ต้นฉบับยังอยู่
-ที่เดิม) ไปที่ `<folder>/detected/` ทันทีที่เจอ ไม่ต้องรอให้สแกนทั้ง
-โฟลเดอร์เสร็จก่อน
+Second pass over `motion_scan.py`'s clips: reports which clips contain the
+requested classes and copies matches to `<folder>/detected/` as soon as each
+one is found.
 
 ```bash
-pip install ultralytics
-
-# รายงานว่าคลิปไหนใน <folder>/output มี person/dog/cat แล้วคัดลอกที่เจอ
-# ไปที่ <folder>/detected/ ทันที (ค่าเริ่มต้น --workers 5 -- ลดอัตโนมัติ
-# ถ้า VRAM ว่างไม่พอ):
-python detect_objects.py --folder "F:/cam1"
-
-# แค่รายงาน ไม่ต้องคัดลอกอะไร:
-python detect_objects.py --folder "F:/cam1" --no-copy
-
-# ย้ายไฟล์ที่ตรงเงื่อนไขแทนการคัดลอก (เอาออกจาก output/ ด้วย):
-python detect_objects.py --folder "F:/cam1" --move
-
-# กำหนด class เอง (ต้องเป็นชื่อที่โมเดลรู้จัก เช่น class ของ COCO สำหรับ
-# yolo11x.pt ที่เป็นค่าเริ่มต้น -- "snake" ไม่ได้อยู่ในนั้น):
-python detect_objects.py --folder "F:/cam1" --classes dog,cat,bird
-
-# กำหนดจำนวน worker เอง (แต่ละ worker โหลดโมเดลของตัวเอง):
-python detect_objects.py --folder "F:/cam1" --workers 3
+python detect_objects.py --folder /path/to/cam1                 # copy matches
+python detect_objects.py --folder /path/to/cam1 --no-copy       # report only
+python detect_objects.py --folder /path/to/cam1 --move          # move instead of copy
+python detect_objects.py --folder /path/to/cam1 --classes dog,cat,bird
+python detect_objects.py --folder /path/to/cam1 --workers 3
 ```
 
-flag ที่มีประโยชน์อีกตัว: `--batch-size` (ค่าเริ่มต้น 16) กำหนดว่าจะส่ง
-เฟรมที่สุ่มมากี่เฟรมต่อการเรียกโมเดลหนึ่งครั้ง -- ยิ่งมากยิ่งทำให้ GPU
-ว่างงานน้อยลง แต่ก็ใช้ VRAM มากขึ้นตามไปด้วย
-
-`--workers` จะถูกลดจำนวนลงอัตโนมัติถ้าค่า `--workers` x `--batch-size`
-ที่ขอมาจะใช้ VRAM เกินกว่าที่ว่างอยู่จริง (วัดจากการเรียกโมเดลจริงๆ ครั้ง
-หนึ่งก่อน ไม่ได้เดาเอา) จะมีข้อความแจ้งถ้าต้องลดให้ ทำแบบนี้เพราะค่าที่
-สูงเกินไปอาจทำให้ทั้งเครื่องค้าง ไม่ใช่แค่สคริปต์พังเฉยๆ
+Classes must exist in the model's vocabulary (COCO for the default
+`yolo11x.pt`). `--batch-size` (default 16) trades VRAM for GPU utilization;
+`--workers` is automatically reduced if the requested workers x batch size
+wouldn't fit in free VRAM.
 
 ## object_scan.py
 
-หาวัตถุที่สนใจ (Target) จาก**ฟุตเทจดิบโดยตรง** ไม่ต้องผ่าน motion ก่อน
-ใช้ YOLO ดูแค่ **keyframe** (กล้องชุดนี้มีทุก 2 วินาที) แล้วรวมผลเป็น
-**Sighting** = ช่วงเวลาจริง (วัน-เวลา) ที่ Target ปรากฏ ต่างจาก
-`detect_objects.py` ที่ตอบแค่ว่า "คลิปสั้นนี้มีแมวไหม" -- ตัวนี้ตอบว่า
-"แมวมาตอนไหนบ้าง" ทั้งวัน ดูศัพท์ใน [CONTEXT.md](CONTEXT.md)
+Finds a Target directly in raw footage, looking only at keyframes, and
+merges detections into **Sightings** (wall-clock time ranges). Where
+`detect_objects.py` answers "does this short clip contain a cat?", this
+answers "when did the cat show up today?".
 
 ```bash
-# โฟลเดอร์กล้องแบบปกติ: อ่าน <folder>/data, ใช้ <folder>/region.json ถ้ามี,
-# เขียนผลที่ <folder>/sightings/
-python object_scan.py --folder "F:/cam1"
+# camera folder: reads <folder>/data, uses <folder>/region.json if present,
+# writes <folder>/sightings/
+python object_scan.py --folder /path/to/cam1
 
-# โฟลเดอร์ไหนก็ได้ (ค้นหาไฟล์แบบ recursive) เช่นโฟลเดอร์ที่ export จาก NVR
-# ตรงๆ -- ผลอยู่ที่ <input>/sightings/
-python object_scan.py --input "data/cat"
+# any folder (searched recursively); output goes to <input>/sightings/
+python object_scan.py --input /path/to/recordings --targets animal,person,car
 
-# Target อื่น: ชื่อ class ของโมเดล หรือกลุ่ม (animal = cat + dog):
-python object_scan.py --input "data/cat" --targets animal,person,car
-
-# จัดกลุ่ม Sighting ใหม่ด้วย gap อื่น -- ไม่ต้องสแกนใหม่ (ใช้ Hit เดิม):
-python object_scan.py --input "data/cat" --gap 30
+# regroup existing hits with a different gap -- no rescan
+python object_scan.py --input /path/to/recordings --gap 30
 ```
 
-ผลลัพธ์ใน `sightings/`:
+Output (`sightings/`): `sightings.csv` (one row per Sighting), `images/`
+(best keyframe per Sighting, annotated), `hits.jsonl` (raw detections).
 
-- `sightings.csv` -- หนึ่งแถวต่อ Sighting: target, เวลาเริ่ม/จบ, ไฟล์ +
-  offset (วินาที), จำนวน hit, conf สูงสุด, class ดิบที่โมเดลทาย, `nearest_px`
-  (ระยะใกล้สุดถึง Region, 0 = อยู่ข้างใน -- ใช้เรียงดู ไม่ได้ใช้คัดทิ้ง)
-- `images/` -- ภาพ keyframe ที่ conf สูงสุดของแต่ละ Sighting พร้อมกรอบ +
-  class + conf (และเส้น Region ถ้ามี)
-- `hits.jsonl` -- Hit ดิบทุกตัว (Sighting สร้างจากไฟล์นี้)
+Notes:
 
-ข้อควรรู้:
+- Re-runs only scan new/unfinished files; changing targets, confidence,
+  image size, model or region starts over (`--restart` forces it).
+- With a region, a crop around it is scanned at `--imgsz 640`; without one,
+  the full frame is scanned at 1280 so small objects (~20px) aren't lost.
+  The region ranks Sightings by distance, it never filters them out.
+- Objects need to be roughly 15-20px or larger to be detected.
+- Wall-clock time comes from file names (`2026-08-24_044612.mp4` or raw NVR
+  names containing start/end timestamps).
+- Decoding uses NVDEC (`-hwaccel cuda`), which is faster than CPU for
+  keyframe-only decode.
 
-- **รันซ้ำได้/ต่อได้** -- จำว่าไฟล์ไหนสแกนเสร็จแล้ว รันซ้ำจะสแกนแค่ไฟล์ที่
-  เหลือหรือไฟล์ใหม่ เปลี่ยน `--targets`/`--conf`/`--imgsz`/`--model`/Region
-  จะเริ่มใหม่ (`--restart` บังคับเริ่มใหม่)
-- **มี Region**: ตัดภาพรอบ Region (x3) ส่งให้โมเดลที่ `--imgsz 640` --
-  วัตถุเล็กใหญ่ขึ้นพอให้ตรวจเจอ **ไม่มี Region** (หรือ `--no-region`):
-  ทั้งภาพที่ 1280 (ที่ 640 แมวขนาด ~20px หายหมด)
-- **วัตถุต้องใหญ่พอ** -- ราวๆ 15-20px ขึ้นไป ลูกแมว ~8px ที่ 1080p ตรวจไม่ได้
-  เลยไม่ว่าตั้งค่าแบบไหน กรณีแบบนั้นใช้ `motion_scan.py`
-- เวลาจริงอ่านจากชื่อไฟล์ (รองรับทั้ง `2026-08-24_044612.mp4` และชื่อดิบจาก
-  NVR `..._20261004144359_20261004145059_....mp4`) Sighting รวมข้ามไฟล์ได้
-  ถ้าไฟล์ต่อกันจริง (ตรวจช่องว่างให้)
-- ถอดรหัสด้วย NVDEC (`-hwaccel cuda`) -- สำหรับ keyframe อย่างเดียว เร็วกว่า
-  CPU ~3-4 เท่า (ตรงข้ามกับ `motion_scan.py` ที่ decode ทุกเฟรม)
+**Targets:** any COCO class name (`person`, `cat`, `dog`, `car`, `truck`,
+`bicycle`, `bird`, ...), or a group -- `animal` = `cat` + `dog` (default),
+since small cats are often labelled `dog`. Groups live in `CLASS_GROUPS` in
+`object_scan.py`. Quote names containing spaces: `--targets "person,cell phone"`.
+The default model is `yolo26x.pt`; change it with `--model`.
 
-### Target ที่ใช้ได้ (`--targets`)
+### Directly from an NVR (Hikvision / Dahua), live watch, Sighting Wall
 
-โมเดล default (`yolo26x.pt`) เทรนบน COCO รู้จัก 80 class นี้เท่านั้น (สะกดตามนี้เป๊ะ
-คั่นหลาย Target ด้วย `,` เช่น `--targets animal,person,car`) -- class นอกรายการนี้
-(เช่น งู, ตุ๊กแก) ตรวจไม่ได้ ต้องใช้โมเดลอื่น/เทรนเอง:
+Downloads footage from the NVR in chunks (default 5 minutes) through the
+vendor SDKs, scans each chunk and deletes it, keeping only results. Windows
+only (the SDKs are Windows DLLs). See
+[ADR 0003](docs/adr/0003-nvr-source-uses-vendor-sdks.md) for why the SDKs
+are used instead of ISAPI.
 
-| หมวด | class |
-|---|---|
-| คน/สัตว์ | `person`, `bird`, `cat`, `dog`, `horse`, `sheep`, `cow`, `elephant`, `bear`, `zebra`, `giraffe` |
-| ยานพาหนะ | `bicycle`, `car`, `motorcycle`, `airplane`, `bus`, `train`, `truck`, `boat` |
-| ถนน | `traffic light`, `fire hydrant`, `stop sign`, `parking meter`, `bench` |
-| ของติดตัว | `backpack`, `umbrella`, `handbag`, `tie`, `suitcase` |
-| กีฬา | `frisbee`, `skis`, `snowboard`, `sports ball`, `kite`, `baseball bat`, `baseball glove`, `skateboard`, `surfboard`, `tennis racket` |
-| ครัว/อาหาร | `bottle`, `wine glass`, `cup`, `fork`, `knife`, `spoon`, `bowl`, `banana`, `apple`, `sandwich`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake` |
-| เฟอร์นิเจอร์/เครื่องใช้ | `chair`, `couch`, `potted plant`, `bed`, `dining table`, `toilet`, `tv`, `laptop`, `mouse`, `remote`, `keyboard`, `cell phone`, `microwave`, `oven`, `toaster`, `sink`, `refrigerator` |
-| อื่นๆ | `book`, `clock`, `vase`, `scissors`, `teddy bear`, `hair drier`, `toothbrush` |
+Setup: put the SDK wrappers in a folder of your choice and point
+`NVR_SDK_DIR` at it in `.env` (see [.env.example](.env.example)); NVR
+addresses and credentials go in that folder's `nvrs.env`.
 
-กลุ่ม (นับหลาย class เป็น Target เดียว, แก้/เพิ่มได้ที่ `CLASS_GROUPS` ใน `object_scan.py`):
-- `animal` = `cat` + `dog` (default) -- แมวตัวเล็กในกล้องวงจรปิดมักถูกทายเป็น `dog`
-
-class ที่มีช่องว่างต้องใส่เครื่องหมายคำพูดทั้งก้อน เช่น `--targets "person,cell phone"`
-ถ้าพิมพ์ชื่อผิด/ไม่มีในโมเดล โปรแกรมจะหยุดพร้อมบอกชื่อที่ไม่รู้จัก
-
-**ทำไม default เป็น `yolo26x.pt` ไม่ใช่ `yolo11x.pt`** (เทียบ 2026-10-08, ความเร็วเท่ากัน):
-- `data/cata5` (แมวขาวดำตัวเล็ก กลางคืน): yolo11x ทายแมวตัวเดียวกันว่า `person` 4 ช่วง
-  ทำให้ `--targets animal` เจอแค่ 7 keyframe; yolo26x ทายเป็น `dog` ทุกครั้ง (อยู่ใน `animal`)
-  เจอ 18 keyframe ครอบคลุม 01:48-01:51 ต่อเนื่องกว่ามาก
-- กล้องจริง 30 นาที (Hik ห้อง รปภ. + Dahua ทางออก): yolo11x มี `dog 0.68` ที่จริงเป็นคนก้มตัว
-  yolo26x ไม่มี; คนเกือบทุกช่วงตรงกัน yolo26x พลาดคนที่ชิดกล้องจนเห็นแค่ขา 1 ครั้ง
-
-เปลี่ยนโมเดลด้วย `--model` (เช่น `--model yolo11x.pt` -- ultralytics ดาวน์โหลดให้เองครั้งแรก)
-โมเดล YOLO ตระกูล COCO ใช้ชื่อ class ชุดเดียวกันนี้ เปลี่ยนโมเดลแล้วผลเดิมจะถูกสแกนใหม่
-(โมเดลเป็นส่วนหนึ่งของสิ่งที่ตัดสินว่าอะไรนับเป็น Hit) และ `--conf` ที่เหมาะอาจต่างไป
-
-### ดึงจาก NVR ตรงๆ (Hikvision / Dahua) + Live Watch + Sighting Wall
-
-ไม่ต้อง export ไฟล์เอง -- โหลดจาก NVR เป็นก้อน (default 5 นาที) ผ่าน SDK ของแต่ละยี่ห้อ
-สแกนแล้วลบทิ้งทันที เก็บไว้แค่ผลลัพธ์ (ทำไมใช้ SDK ไม่ใช่ ISAPI: [ADR 0003](docs/adr/0003-nvr-source-uses-vendor-sdks.md))
-
-เตรียมครั้งเดียว:
-- SDK อยู่ที่โฟลเดอร์กลาง `D:/Github/for_UJP/nvr-sdk` (ใช้ร่วมกับ project อื่น) -- ตั้ง path ใน `.env`
-  ของ repo นี้ (ดู `.env.example`): `NVR_SDK_DIR=D:/Github/for_UJP/nvr-sdk`
-- Dahua: `pip install D:/Github/for_UJP/nvr-sdk/dahua/NetSDK-2.0.0.1-py3-none-win_amd64.whl`
-- รายชื่อ NVR + user/password อยู่ใน `nvr-sdk/nvrs.env` (copy จาก `nvrs.env.example`)
-- ทดสอบ: `python D:/Github/for_UJP/nvr-sdk/nvr.py test hik1:3`
-- Windows เท่านั้น (SDK เป็น DLL ของ Windows)
-
-กล้องระบุเป็น `<ชื่อ NVR>:<เลขกล้องบนจอ NVR>` เช่น `hik1:3` คั่นด้วย `,` ได้หลายกล้อง
-ทุกกล้องใช้โมเดลตัวเดียวกัน (8 กล้องพร้อมกันไม่กิน VRAM 8 เท่า)
+Cameras are `<nvr name>:<channel>`, comma-separated. All cameras share one
+model instance.
 
 ```bash
-# ย้อนหลัง: จากเวลานี้ "ไปข้างหน้า" จนถึงตอนกดรัน แล้วจบเอง (hh:mm:ss = วันนี้ หรือใส่วันเต็ม)
+# from a past time forward until now, then exit
 python object_scan.py nvr --camera hik1:3,dahua1:1 --from 09:00:00
 python object_scan.py nvr --camera hik1:3 --from "2026-10-07 22:00:00"
 
-# ย้อนหลัง: จากเวลานี้ "ถอยหลัง" (ใหม่ไปเก่า เจอล่าสุดก่อน) ไป --end (default 1h)
+# newest first, back over --end (default 1h)
 python object_scan.py nvr --camera hik1:3 --from 10:00:00 --direction backward --end 3h
 
-# สด: หลายกล้อง, Ctrl+C หยุด
+# live, Ctrl+C to stop
 python object_scan.py live --camera hik1:3,dahua1:1
 
-# เลือก Region จากภาพสดของกล้อง (เก็บที่ <root>/<กล้อง>/region.json)
+# pick a region from the live image
 python object_scan.py select-region --camera hik1:3
 
-# จอ 2x2 แสดง Sighting ที่เจอ วน 1>2>3>4>1 (q/Esc ปิด, f เต็มจอ)
+# 2x2 wall of Sightings as they arrive (q/Esc quit, f fullscreen)
 python sighting_wall.py
 ```
 
-"ย้อนหลังจนถึงตอนนี้ แล้วดูสดต่อ" = เปิด `nvr` กับ `live` **พร้อมกัน** (คนละหน้าต่าง)
-`nvr` สแกนถึงเวลาที่กดรันแล้วจบเอง `live` ดูต่อจากนั้น ไม่มีช่องว่าง
-
-ผลลัพธ์อยู่ที่ `<root>/<nvr>_ch<N>/sightings/` (root = `NVR_SCAN_ROOT` ใน `.env` หรือ
-`--root`, default `./nvr_scans`) -- **หนึ่งโฟลเดอร์ต่อกล้อง สะสมทุกครั้งที่รัน** (ย้อนหลัง/สด):
-`sightings.csv` (มีคอลัมน์ `source` = nvr / live / nvr+live), `images/`, `frames/`
-(keyframe ที่มี Hit -- ภาพ Sighting วาดจากนี่ เพราะวิดีโอถูกลบแล้ว), `hits_nvr.jsonl`,
-`hits_live.jsonl`
-
-ข้อควรรู้:
-- **ช่วงเวลาที่สแกนแล้วไม่สแกนซ้ำ** (ถ้าตั้งค่าเดิม) -- ก้อนวิดีโอตัดตาม grid นาฬิกาคงที่
-  (00, 05, 10, ...) จำไว้ใน `.nvr_state.json`; `--restart` บังคับสแกนใหม่ (Hit เก่าย้ายไป `.bak`)
-- ก้อนที่โหลดไม่สำเร็จ (retry 3 ครั้งแล้ว) จะไม่ถูกจดว่าสแกนแล้ว -- รันซ้ำเพื่อลองใหม่
-- `--connections` (default 4) จำกัดการโหลดพร้อมกันต่อ NVR (Hik บางตัว error 10 ถ้าเยอะ)
-- ก้อนที่จบใกล้ "ตอนนี้" ไม่ถึง 90 วินาที จะรอให้ NVR บันทึกเสร็จก่อนค่อยโหลด
-- ความเร็วขึ้นกับเน็ตล้วนๆ (2026-10-08 วัดได้ 10-70x realtime ต่อกล้องแล้วแต่ช่วงเวลา) -- โหลดเฉพาะ keyframe ไม่ได้: NVR Hik ส่งมาครบทุกเฟรมทั้งแบบ download และ playback 16x
-- เวลาใน **live** ช้ากว่านาฬิกาบนภาพ ~4-8 วินาที (decode เฉพาะ keyframe ทำให้ได้เฟรมช้า
-  ไปราว 1 รอบ keyframe) ย้อนหลังคลาด ~1 วินาที -- Sighting ยังรวมกันได้ด้วย gap 10 วินาที
-- กล้องที่ login ไม่ผ่าน/สตรีมหลุด ข้ามไป ไม่ลากกล้องอื่น; live reconnect เอง
-- `nvr` แสดงแถบรวม + แถบต่อกล้อง: `at` = เวลาในวิดีโอที่สแกนถึงล่าสุด, จำนวน Hit, และสถานะ
-  (downloading / waiting for NVR / retrying / done) -- ภาพขึ้น Sighting Wall ภายใน ~3 วินาทีหลังเจอ
+Run `nvr` and `live` at the same time for "catch up, then keep watching".
+Results accumulate per camera under `<root>/<nvr>_ch<N>/sightings/`
+(`NVR_SCAN_ROOT` in `.env` or `--root`, default `./nvr_scans`).
+Already-scanned time is skipped on later runs; failed chunks are retried on
+the next run. Speed is network-bound -- NVRs send every frame, so
+keyframe-only download isn't possible. Live timestamps lag the burned-in
+clock by a few seconds.
 
 ## censor.py / select_region.py
 
-เครื่องมือชุดแยกต่างหาก ไม่เกี่ยวกับ motion/detection ด้านบน: ใช้เบลอหรือ
-ปิดบังพื้นที่ส่วนตัวในโฟลเดอร์คลิปที่ตัดไว้แล้วแบบ *flat* (เช่น โฟลเดอร์
-`output/` ของเครื่องมืออื่น ไม่ใช่รูปแบบ `data`/`output`/`region.json`
-ของ `motion_scan.py`) การเลือกพื้นที่ทำครั้งเดียว จากนั้นรัน censor
-แบบไม่ต้องเฝ้าได้กับทุกคลิปในโฟลเดอร์
+Separate from the pipeline above: hides a region in every clip of a flat
+folder of already-cut clips.
 
 ```bash
-# 1. เลือกพื้นที่ครั้งเดียวต่อโฟลเดอร์ (บันทึกเป็น <folder>/region.json)
-#    คลิกจุด, คลิกขวาเพื่อยกเลิกจุดล่าสุด, กด N เพื่อปิดรูปทรงปัจจุบันแล้ว
-#    เริ่มรูปใหม่ (หลายรูปทรงจะรวมเป็นพื้นที่เดียว), Enter/S เพื่อบันทึก,
-#    Esc/Q เพื่อยกเลิก; ลากจุดที่วางไว้แล้วได้ถ้าคลิกใกล้จุดนั้นในระยะ
-#    ~10px:
-python select_region.py --folder "F:/cam1/output"
+# 1. pick the region once (saved as <folder>/region.json); points can be
+#    dragged after placing
+python select_region.py --folder /path/to/clips
 
-# 2. เบลอ/ปิดทุกคลิปในโฟลเดอร์นั้น เขียนผลลัพธ์ไปที่ <folder>/censored/
-#    (ข้ามคลิปที่มีอยู่แล้ว เว้นแต่ใส่ --force):
-python censor.py --folder "F:/cam1/output"
+# 2. censor every clip -> <folder>/censored/ (existing outputs skipped
+#    unless --force)
+python censor.py --folder /path/to/clips
 ```
 
-`--frame-source <clip>` ใน `select_region.py` ใช้พรีวิวคลิปที่ระบุแทน
-คลิปแรกตามลำดับชื่อไฟล์ (ใช้กรณีเฟรมแรกของคลิปแรกไม่เหมาะเอามาดู เช่น
-แสงน้อยเกินไป หรือภาพเบลอ) ตัวเลือกพื้นที่จะย่อภาพให้พอดีกับหน้าจอ
-อัตโนมัติถ้าเฟรมใหญ่กว่าหน้าจอ (เช่นไฟล์ export 2K/4K) แต่การเลือกพื้นที่
-ยังคงอิงตามความละเอียดต้นฉบับเต็มๆ อยู่ดี ไม่ขึ้นกับขนาดที่แสดงบนจอ
-
-`censor.py --effect` ค่าเริ่มต้นคือ `black`:
-
-| effect | ทำอะไร |
+| `--effect` | what it does |
 |---|---|
-| `black` | เติมสีดำทึบทับพื้นที่ที่เลือก ขอบคม -- ถูกที่สุด เป็นค่าเริ่มต้น |
-| `blur` | เบลอแบบ gaussian ทับพื้นที่ที่เลือกแทนสีดำ (`--blur-sigma` ค่าเริ่มต้น 55) ใส่ `--gpu` เพื่อรันบน CUDA ผ่าน PyTorch แทน CPU `cv2.GaussianBlur` (เร็วกว่า CPU blur ราว 9 เท่า ช้ากว่าสีดำทึบแค่ราว 2 เท่า) |
-| `crop` | ตัดเฟรมให้เหลือแค่กรอบสี่เหลี่ยมของพื้นที่ที่เลือก แทนที่จะปิดบังอะไร -- **จุดที่เลือกไว้จะหมายถึง "พื้นที่ที่จะเก็บไว้" ตรงข้ามกับ black/blur ที่หมายถึง "พื้นที่ที่จะปิดบัง"** ดังนั้น `crop` ต้องเลือก `region.json` แยกต่างหาก (ชี้ด้วย `--region`) ไม่ควรใช้ region เดิมที่เลือกไว้สำหรับ black/blur |
+| `black` (default) | solid black fill, hard edge -- cheapest |
+| `blur` | gaussian blur (`--blur-sigma`, default 55); add `--gpu` for PyTorch CUDA (much faster than CPU blur) |
+| `crop` | crop the frame to the region's bounding box. Here the region means *keep*, not *hide*, so pick a separate region file for it |
 
 ```bash
-# เบลอแบบ gaussian แทนสีดำทึบ:
-python censor.py --folder "F:/cam1/output" --effect blur
-
-# แบบเดียวกัน แต่รันบน GPU:
-python censor.py --folder "F:/cam1/output" --effect blur --gpu
-
-# ครอปตามพื้นที่ "ที่จะเก็บไว้" ที่เลือกแยกต่างหาก:
-python select_region.py --folder "F:/cam1/output" --region "F:/cam1/output/crop_region.json"
-python censor.py --folder "F:/cam1/output" --effect crop --region "F:/cam1/output/crop_region.json"
-
-# เขียนทับผลลัพธ์เดิมใน <folder>/censored/:
-python censor.py --folder "F:/cam1/output" --force
+python censor.py --folder /path/to/clips --effect blur --gpu
+python select_region.py --folder /path/to/clips --region /path/to/clips/crop_region.json
+python censor.py --folder /path/to/clips --effect crop --region /path/to/clips/crop_region.json
 ```
 
-`--workers` ค่าเริ่มต้นคือ `os.cpu_count() - 1` (เป็นงานคำนวณภาพบน CPU
-ล้วนๆ บวกกับ `ffmpeg` หนึ่งโปรเซสต่อคลิป ไม่มีปัญหาแย่งชิง GPU/VRAM ต้อง
-ระวังเหมือน `detect_objects.py`) คลิปเสียหนึ่งไฟล์ (ไฟล์พัง, ความละเอียด
-แปลกๆ) ไม่ทำให้ทั้ง batch พังตาม -- ทุก exception ต่อคลิปถูกดักจับและ
-รายงาน ไม่หยุดการทำงานทั้งหมด
+`--frame-source <clip>` picks which clip's first frame to preview. One bad
+clip doesn't stop the batch.
 
-## สคริปต์ช่วยเหลืออื่นๆ
+## Other scripts
 
-- **rename_cctv_download.py** -- เปลี่ยนชื่อไฟล์ที่ export จาก NVR
-  Hikvision (ชื่อไฟล์เป็นตัวเลขล้วน) ให้เป็น timestamp ที่เรียงลำดับได้
-  โดยอ่านจากไฟล์รายการ `.txt` ที่ export มาด้วยกัน:
-  `python rename_cctv_download.py [folder]` (ค่าเริ่มต้นคือ `.`
-  คาดว่ามี `./data` และไฟล์ `New Text Document.txt`)
-- **bench_decord_gpu.py** -- เบนช์มาร์กทดสอบความเร็วถอดรหัสแบบครั้งเดียว
-  (decord/NVDEC เทียบกับ OpenCV/CPU) ไม่ได้เป็นส่วนหนึ่งของ workflow ปกติ
-  เก็บไว้เป็นข้อมูลอ้างอิง
+- `rename_cctv_download.py [folder]` -- renames Hikvision NVR exports from
+  numeric names to sortable timestamps using the exported file-list `.txt`.
+- `bench_decord_gpu.py` -- one-off decode benchmark, not part of the
+  workflow.
 
-## หมายเหตุเกี่ยวกับไฟล์ข้อมูล
+## Notes on Hikvision exports
 
-โฟลเดอร์ต่อวัน/ต่อกล้อง (เช่น `20260620/`, `20260621-24_1/`) เก็บไฟล์
-วิดีโอต้นฉบับและผลลัพธ์การสแกน โฟลเดอร์เหล่านี้ (`data/`, `output/` และ
-นามสกุลไฟล์วิดีโอทั้งหมด) ถูกใส่ไว้ใน `.gitignore` โดยตั้งใจ -- ไม่ต้อง
-พยายาม commit หรือ "จัดระเบียบ" ไฟล์วิดีโอในโฟลเดอร์เหล่านี้ ถือว่าเป็น
-ข้อมูลทำงาน local ไม่ใช่ส่วนหนึ่งของโค้ด
+Some Hikvision NVR `.mp4` exports are really an `IMKH` header followed by
+MPEG-PS, with no seek index. The scripts handle this fine, but GUI players
+may seek or fast-forward poorly. Remux before manual review:
+
+```bash
+ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4
+```
+
+Footage folders (`data/`, `output/`, video files) are gitignored.
