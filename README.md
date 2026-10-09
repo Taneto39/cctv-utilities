@@ -20,6 +20,7 @@ detect_objects.py        second-pass YOLO filter over motion_scan.py's clips
 object_scan.py           YOLO over raw footage (keyframes) -> Sightings
 nvr_scan.py              NVR download / live-watch source for object_scan.py
 sighting_wall.py         2x2 viewer for Sightings as they arrive
+sighting_share.py        copy Sighting pictures to a (synced) folder as they arrive
 select_region.py         region picker UI + region.json format
 censor.py                blur/black-out/crop a region in a flat folder of clips
 rename_cctv_download.py  rename numeric NVR exports to sortable timestamps
@@ -196,6 +197,9 @@ python object_scan.py select-region --camera hik1:3
 
 # 2x2 wall of Sightings as they arrive (q/Esc quit, f fullscreen)
 python sighting_wall.py
+
+# copy each new Sighting picture into a folder to share (e.g. a synced cloud folder)
+python sighting_share.py --dest /path/to/shared --live-only
 ```
 
 Run `nvr` and `live` at the same time for "catch up, then keep watching".
