@@ -2,9 +2,12 @@
 """
 sighting_share.py - copies each Sighting's picture into a destination
 folder as it is found, e.g. a Google Drive / OneDrive / LINE-synced folder
-to share live with someone else. Same input as the Sighting Wall (every
-camera's sightings.csv + images/ under one root); like the Wall it only
-reads, so stopping it never affects a scan. No window -- runs headless.
+to share live with someone else. Copies the clean keyframe from frames/
+(no boxes or region outline), not the annotated picture in images/ -- the
+images/.index.json written by the scan says which frame each picture was
+drawn from. Same input as the Sighting Wall (every camera folder under one
+root); like the Wall it only reads, so stopping it never affects a scan.
+No window -- runs headless.
 
     python sighting_share.py --dest /path/to/shared-folder
     python sighting_share.py --dest /path/to/shared-folder --live-only --camera hik1:3
@@ -16,6 +19,7 @@ name and renamed, so a sync client never uploads a half-written file.
 Ctrl+C to stop.
 """
 import argparse
+import json
 import os
 import shutil
 import time
@@ -31,6 +35,10 @@ def _sightings(root, cameras):
         camera = csv_path.parent.parent.name
         if cameras and camera not in cameras:
             continue
+        try:
+            index = json.loads((csv_path.parent / "images" / ".index.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            index = {}
         for r in _read_csv(csv_path):
             if not r.get("image"):
                 continue
@@ -38,9 +46,22 @@ def _sightings(root, cameras):
                 r["end"] = datetime.strptime(r["end"], "%Y-%m-%d %H:%M:%S")
             except (KeyError, ValueError):
                 continue
+            frame = index.get(r["image"])
+            if not frame:    # index not written yet: picked up next poll
+                continue
             r["camera"] = camera
-            r["image_path"] = csv_path.parent / "images" / r["image"]
+            r["frame"] = frame
+            r["frame_path"] = csv_path.parent / "frames" / frame
             yield r
+
+
+def _same_file(src, dest):
+    """True when dest already holds src -- size match is enough to tell a
+    clean frame from an older annotated copy of the same Sighting."""
+    try:
+        return src.stat().st_size == dest.stat().st_size
+    except OSError:
+        return False
 
 
 def _copy(src, dest):
@@ -49,7 +70,7 @@ def _copy(src, dest):
         shutil.copyfile(src, tmp)
         os.replace(tmp, dest)
         return True
-    except OSError:          # source being rewritten by a scan: retried next poll
+    except OSError:          # source missing or locked: retried next poll
         try:
             tmp.unlink()
         except OSError:
@@ -80,7 +101,7 @@ def main():
             print(f"[sighting-share] warning: no Sightings folder for camera {c!r} under {args.root} (yet)",
                   flush=True)
     since = None if args.all else datetime.now().replace(microsecond=0)
-    copied = {}              # dest path -> source mtime it was copied from
+    copied = {}              # dest path -> frame name it was copied from
     print(f"[sighting-share] {Path(args.root).resolve()} -> {dest.resolve()} -- Ctrl+C to stop", flush=True)
     try:
         while True:
@@ -89,19 +110,15 @@ def main():
                     continue
                 if args.live_only and "live" not in r.get("source", ""):
                     continue
-                try:
-                    m = r["image_path"].stat().st_mtime
-                except OSError:
-                    continue
                 out = dest / f"{r['camera']}_{r['image']}"
-                if copied.get(out) == m:
+                if copied.get(out) == r["frame"]:
                     continue
-                if out not in copied and out.exists() and out.stat().st_mtime >= m:
-                    copied[out] = m      # already copied by an earlier run
+                if out not in copied and _same_file(r["frame_path"], out):
+                    copied[out] = r["frame"]     # already copied by an earlier run
                     continue
-                if _copy(r["image_path"], out):
+                if _copy(r["frame_path"], out):
                     print(f"[sighting-share] {'updated' if out in copied else 'new'}: {out.name}", flush=True)
-                    copied[out] = m
+                    copied[out] = r["frame"]
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
