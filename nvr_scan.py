@@ -40,6 +40,7 @@ option, so it downloads every frame.
 """
 import argparse
 import csv
+import heapq
 import json
 import os
 import queue
@@ -492,13 +493,43 @@ class Detector:
 # Recorded footage (Object Scan, NVR source)
 # --------------------------------------------------------------------------
 
+class FairGate:
+    """Caps concurrent downloads on one NVR, handing a free slot to whichever
+    waiting camera is furthest behind in the scan (lowest priority value)
+    instead of whichever thread happens to grab it first. A plain semaphore
+    let some cameras on a busy NVR re-take slots over and over while others
+    starved for hours; this keeps every camera on an NVR moving together."""
+
+    def __init__(self, n):
+        self.n, self.busy = n, 0
+        self.cv = threading.Condition()
+        self.waiting = []   # heap of (priority, seq)
+        self.seq = 0
+
+    def acquire(self, priority):
+        with self.cv:
+            self.seq += 1
+            entry = (priority, self.seq)
+            heapq.heappush(self.waiting, entry)
+            while self.busy >= self.n or self.waiting[0] != entry:
+                self.cv.wait()
+            heapq.heappop(self.waiting)
+            self.busy += 1
+            self.cv.notify_all()   # the next in line may fit too
+
+    def release(self):
+        with self.cv:
+            self.busy -= 1
+            self.cv.notify_all()
+
+
 class NvrCameraJob:
     """Downloads one camera's chunks (a little ahead) and decodes their
     keyframes into the shared detector queue."""
 
-    def __init__(self, cam, store, chunks, q, args, stats):
+    def __init__(self, cam, store, chunks, q, args, stats, gate):
         self.cam, self.store, self.chunks, self.q = cam, store, chunks, q
-        self.args, self.stats = args, stats
+        self.args, self.stats, self.gate = args, stats, gate
         self.status = {"state": "starting"}   # set by the download thread, shown on the progress bar
         self.bar = None
         self.on_progress = None
@@ -523,15 +554,21 @@ class NvrCameraJob:
                 time.sleep(wait)
             dst = self.tmp / f"{cs:%Y%m%d-%H%M%S}{ext}"
             what = "keyframes" if self.keyframes else "downloading"
-            self.status["state"] = f"{what} {cs:%H:%M}-{ce:%H:%M}"
             fetch = self.cam.download_keyframes if self.keyframes else self.cam.download
+            # position in scan order: the camera furthest behind gets the next slot
+            priority = _ts(cs) if self.args.direction == "forward" else -_ts(cs)
             result = False
             for attempt in range(DOWNLOAD_RETRIES + 1):
+                self.status["state"] = f"waiting for NVR slot {cs:%H:%M}-{ce:%H:%M}"
+                self.gate.acquire(priority)
+                self.status["state"] = f"{what} {cs:%H:%M}-{ce:%H:%M}"
                 try:
                     result = fetch(cs, ce, str(dst), timeout=self.args.chunk_timeout)
                 except Exception as e:  # SDK hiccup: retry like a failed download
                     _log(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
                     result = False
+                finally:
+                    self.gate.release()
                 if result is not False:
                     break
                 if attempt < DOWNLOAD_RETRIES:
@@ -624,6 +661,7 @@ def run_nvr(args):
     q = queue.Queue(maxsize=args.batch_size * 8)
     stats = {c: {"ok": 0, "no_footage": 0, "failed": [], "skipped": 0} for c in cams}
     jobs, total_s = [], 0.0
+    gates = {}   # one per NVR, shared by its cameras
     for cam_id, cam in cams.items():
         store = stores[cam_id]
         store.load_coverage(det.fingerprint(cam_id, args.model), args.restart)
@@ -631,7 +669,8 @@ def run_nvr(args):
         stats[cam_id]["skipped"] = len(chunks_all) - len(todo)
         total_s += sum((ce - cs).total_seconds() for cs, ce in todo)
         if todo:
-            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats)))
+            gate = gates.setdefault(cam.nvr_name, FairGate(args.connections))
+            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate)))
     print(f"[object-scan nvr] {len(cams)} camera(s), {args.direction} {lo:%Y-%m-%d %H:%M:%S} -> "
           f"{hi:%Y-%m-%d %H:%M:%S}, {len(chunks_all)} chunk(s) of {args.chunk_min} min each per camera"
           + "".join(f"\n  {c}: {stats[c]['skipped']} chunk(s) already scanned" for c in cams if stats[c]["skipped"]))
@@ -851,7 +890,8 @@ def main(argv):
                    help="backward only: how far back to go from --from (default 1h; e.g. 90m, 6h).")
     p.add_argument("--chunk-min", type=int, default=5, help="Download chunk length in minutes (default 5).")
     p.add_argument("--connections", type=int, default=4,
-                   help="Max concurrent downloads per NVR (default 4; some NVRs error under more).")
+                   help="Max concurrent downloads per NVR, shared fairly by its cameras "
+                        "(default 4; some NVRs error under more).")
     p.add_argument("--prefetch", type=int, default=2, help="Chunks downloaded ahead per camera (default 2).")
     p.add_argument("--chunk-timeout", type=int, default=300, help="Seconds before a chunk download is abandoned.")
     p.add_argument("--full-download", action="store_true",
