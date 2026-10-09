@@ -649,7 +649,9 @@ def run_nvr(args):
     for name, no in nvr.parse_cameras(args.camera):
         cam_id = f"{name}_ch{no}"
         try:
-            cams[cam_id] = nvr.Camera(name, no, max_connections=args.connections, nvrs=nvrs)
+            # login now: the SDK login is lazy, and a bad password should skip this
+            # camera here rather than fail every chunk inside the download threads
+            cams[cam_id] = nvr.Camera(name, no, max_connections=args.connections, nvrs=nvrs).login()
         except (RuntimeError, SystemExit) as e:
             print(f"[{cam_id}] skipped: {e}")
             continue
@@ -785,7 +787,7 @@ def run_live(args):
         if name not in nvrs:
             print(f"[{cam_id}] skipped: no NVR named '{name}' in nvrs.env")
             continue
-        cams[cam_id] = _LiveCam(nvrs[name], no)
+        cams[cam_id] = nvr.Camera(name, no, nvrs=nvrs)   # RTSP only: no SDK login
         stores[cam_id] = CameraStore(root, cam_id)
     if not cams:
         raise SystemExit("No camera to watch.")
@@ -819,17 +821,6 @@ def run_live(args):
         print(f"  {cam_id}: {n} Hit(s) this session -> {stores[cam_id].out / 'sightings.csv'}")
 
 
-class _LiveCam:
-    """RTSP URL only -- Live Watch doesn't need an SDK login."""
-
-    def __init__(self, cfg, no):
-        self.cfg, self.camera_no = cfg, no
-
-    def rtsp_url(self):
-        import nvr
-        return nvr.Camera.rtsp_url(self)
-
-
 # --------------------------------------------------------------------------
 # select-region on a live snapshot
 # --------------------------------------------------------------------------
@@ -840,7 +831,7 @@ def run_select_region(args):
     (name, no), = nvr.parse_cameras(args.camera)
     if name not in nvrs:
         raise SystemExit(f"No NVR named '{name}' in nvrs.env")
-    cam = _LiveCam(nvrs[name], no)
+    cam = nvr.Camera(name, no, nvrs=nvrs)   # RTSP only: no SDK login
     cam_dir = Path(args.root) / f"{name}_ch{no}"
     cam_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["ffmpeg", "-v", "error", *RTSP_IN, "-i", cam.rtsp_url(), "-frames:v", "1",
