@@ -384,8 +384,7 @@ class CameraStore:
 
 class Detector:
     def __init__(self, args, stores):
-        from ultralytics import YOLO  # deferred: slow import
-        self.model = YOLO(args.model)
+        self.model = osc.load_model(args.model, args.batch_size, use_trt=not args.no_trt)
         self.class_targets = osc.resolve_targets(self.model.names, args.targets)
         self.class_ids = sorted(self.class_targets)
         self.conf = args.conf
@@ -869,7 +868,9 @@ def _detector_args(p):
     p.add_argument("--gap", type=float, default=osc.DEFAULT_GAP_S,
                    help="Max seconds between Hits merged into one Sighting.")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--model", default="yolo26x.pt", help="Default yolo26x.pt (see DESIGN.md).")
+    p.add_argument("--model", default="yolo26x.pt",
+                   help="Default yolo26x.pt (see DESIGN.md), run as a TensorRT engine when TensorRT is installed.")
+    p.add_argument("--no-trt", action="store_true", help="Run the .pt with PyTorch instead of a TensorRT engine.")
 
 
 def main(argv):
