@@ -167,6 +167,35 @@ since small cats are often labelled `dog`. Groups live in `CLASS_GROUPS` in
 `object_scan.py`. Quote names containing spaces: `--targets "person,cell phone"`.
 The default model is `yolo26x.pt`; change it with `--model`.
 
+**TensorRT (optional, ~2.5x faster).** If TensorRT 10 is installed and a
+CUDA GPU is present, a `.pt` model is exported once to a TensorRT FP16
+engine next to it (`yolo26x.engine`, a few minutes) and used from then on
+-- for both local and NVR scans. Measured on an RTX 5070 Ti at 1280 full
+frame: 36.5 -> 90.9 keyframes/s (66.8 vs 29.7 end to end, decode included).
+
+Detections are near-identical but not bit-exact: FP16 shifts conf by ~0.004
+on average and occasionally up to ~0.05, and TensorRT picks different
+kernels each time it builds an engine, so the exact numbers differ per
+build. A hit sitting right at `--conf` can flip either way. On a small
+night cat (18 hit keyframes with PyTorch), one build found all 18 plus one
+more at 0.30; another missed one (0.342 -> 0.297), losing a single-hit
+Sighting. Use `--no-trt` if that matters more than speed.
+
+```bash
+pip install "tensorrt-cu12>=10.8,<11"
+```
+
+- TensorRT 11 doesn't work yet: ultralytics' exporter still calls an API it
+  removed (`EXPLICIT_BATCH`). Without a usable TensorRT the `.pt` runs on
+  PyTorch, with a note.
+- The engine is tied to the GPU and TensorRT version that built it; it's
+  re-exported automatically if it no longer loads, or if `--batch-size` is
+  larger than it was built for. `--no-trt` forces PyTorch.
+- The engine reserves more VRAM than PyTorch (~11 GB vs ~3 GB at batch 8
+  here), since it's built for inputs up to 2x `imgsz`.
+- Switching between `X.pt` and `X.engine` keeps existing scan results:
+  both count as the same model for resume.
+
 ### Directly from an NVR (Hikvision / Dahua), live watch, Sighting Wall
 
 Downloads footage from the NVR in chunks (default 5 minutes) through the

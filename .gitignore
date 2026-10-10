@@ -29,3 +29,7 @@ docs/
 
 # per-machine settings (NVR_SDK_DIR) -- see .env.example
 .env
+
+# TensorRT engines are GPU-specific, exported locally from the .pt (and its ONNX step)
+*.engine
+*.onnx

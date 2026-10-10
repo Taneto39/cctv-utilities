@@ -268,6 +268,68 @@ def region_distance(shapes, x, y):
 # Resume state
 # --------------------------------------------------------------------------
 
+TRT_INSTALL_HINT = 'pip install "tensorrt-cu12>=10.8,<11"'
+
+
+def _engine_batch(path):
+    """Max batch a TensorRT engine was exported for, from the length-prefixed
+    JSON header ultralytics writes in front of it; None if there's no engine."""
+    try:
+        with open(path, "rb") as f:
+            n = int.from_bytes(f.read(4), "little", signed=True)
+            return json.loads(f.read(n)).get("batch")
+    except (OSError, ValueError):
+        return None
+
+
+def _tensorrt_unusable():
+    """Why a TensorRT engine can't be built here, or None if it can."""
+    import torch
+    if not torch.cuda.is_available():
+        return "no CUDA device"
+    try:
+        import tensorrt
+    except ImportError:
+        return f"TensorRT is not installed ({TRT_INSTALL_HINT})"
+    # TensorRT 11 dropped EXPLICIT_BATCH, which ultralytics' exporter still uses
+    if not tensorrt.__version__.startswith("10."):
+        return f"TensorRT {tensorrt.__version__} isn't supported by ultralytics' exporter ({TRT_INSTALL_HINT})"
+    return None
+
+
+def load_model(model, batch_size, use_trt=True):
+    """YOLO for `model`. A .pt is swapped for a TensorRT FP16 engine next to
+    it (~2.5x faster on the dev GPU; conf usually within ~0.01, so only Hits
+    right at --conf can flip -- DESIGN.md), exported on
+    first use and again whenever --batch-size outgrows it or it no longer
+    loads (new GPU / TensorRT version). Falls back to the .pt, with a note,
+    when TensorRT isn't available."""
+    from ultralytics import YOLO  # deferred: slow import, and --help shouldn't need it
+    p = Path(model)
+    if not use_trt or p.suffix != ".pt":
+        return YOLO(model)
+    why = _tensorrt_unusable()
+    if why:
+        print(f"[object-scan] Using PyTorch {p.name}: {why}. TensorRT runs ~2.5x faster, see README.")
+        return YOLO(model)
+    engine = p.with_suffix(".engine")
+    for attempt in range(2):
+        if attempt or (_engine_batch(engine) or 0) < batch_size:
+            print(f"[object-scan] Exporting {p.name} to TensorRT FP16 (batch {batch_size}), "
+                  "once per GPU -- takes a few minutes ...")
+            engine = Path(YOLO(model).export(format="engine", imgsz=1280, batch=batch_size,
+                                             dynamic=True, half=True))
+            engine.with_suffix(".onnx").unlink(missing_ok=True)  # export's intermediate step
+        m = YOLO(str(engine), task="detect")
+        try:
+            m.names  # loads the engine
+            return m
+        except Exception as e:
+            if attempt:
+                raise
+            print(f"[object-scan] {engine.name} didn't load ({e}); re-exporting.")
+
+
 def _file_sig(path):
     st = path.stat()
     return [st.st_size, int(st.st_mtime)]
@@ -280,7 +342,9 @@ def fingerprint(class_targets, conf, imgsz, model, region):
         "class_targets": {str(k): v for k, v in sorted(class_targets.items())},
         "conf": conf,
         "imgsz": imgsz,
-        "model": Path(model).name,
+        # an engine exported from X.pt is the same model (near-identical Hits,
+        # DESIGN.md), so switching between them keeps prior scans
+        "model": Path(model).stem + ".pt" if Path(model).suffix == ".engine" else Path(model).name,
         "region": region["points"] if region else None,
         "crop_scale": REGION_CROP_SCALE if region else None,
     }
@@ -581,7 +645,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--model", default="yolo26x.pt",
                         help="Default yolo26x.pt -- found the small cat far more reliably than yolo11x.pt "
-                             "(which labelled it \"person\"), see DESIGN.md.")
+                             "(which labelled it \"person\"), see DESIGN.md. A .pt runs as a TensorRT "
+                             "engine exported next to it when TensorRT is installed.")
+    parser.add_argument("--no-trt", action="store_true",
+                        help="Run the .pt with PyTorch instead of a TensorRT engine.")
     parser.add_argument("--restart", action="store_true", help="Ignore saved progress and re-scan everything.")
     args = parser.parse_args()
 
@@ -609,8 +676,7 @@ def main():
     paths = discover_recordings(root, out_dir)
     rels = [p.relative_to(root).as_posix() for p in paths]
 
-    from ultralytics import YOLO  # deferred: slow import, and --help shouldn't need it
-    model = YOLO(args.model)
+    model = load_model(args.model, args.batch_size, use_trt=not args.no_trt)
     class_targets = resolve_targets(model.names, args.targets)
     fp = fingerprint(class_targets, args.conf, imgsz, args.model, region)
 
