@@ -408,10 +408,11 @@ class Detector:
         store = self.stores[cam_id]
         if not store.region:
             return None
-        if cam_id not in self.crops:
-            h, w = frame.shape[:2]
-            self.crops[cam_id] = osc.region_crop_box(store.region["points"], w, h)
-        return self.crops[cam_id]
+        h, w = frame.shape[:2]
+        key = (cam_id, w, h)  # per size: a camera's resolution can change mid-scan
+        if key not in self.crops:
+            self.crops[key] = osc.region_crop_box(store.region["points"], w, h)
+        return self.crops[key]
 
     def _run_batch(self, batch):
         # one predict() per (imgsz, input size): ultralytics letterboxes a batch of
@@ -428,6 +429,11 @@ class Detector:
                 img, off = frame[y0:y1, x0:x1], (x0, y0)
             else:
                 img, off = frame, (0, 0)
+            if img.size == 0:
+                # an empty image makes ultralytics' letterbox divide by zero and
+                # kills the whole run -- drop the frame instead
+                _log(f"[{cam_id}] skipped an empty {frame.shape[1]}x{frame.shape[0]} frame at {t:%m-%d %H:%M:%S}")
+                continue
             g = groups.setdefault((self.imgsz[cam_id], img.shape[:2]), ([], [], []))
             g[0].append(item)
             g[1].append(img)

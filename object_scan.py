@@ -147,8 +147,10 @@ def probe_size(path, input_args=()):
                           "stream=width,height", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True).stdout.strip()
     try:
-        w, h = out.split(",")[:2]
-        return int(w), int(h)
+        w, h = (int(v) for v in out.split(",")[:2])
+        if w <= 0 or h <= 0:
+            raise ValueError
+        return w, h
     except ValueError:
         # no path in the message: for Live Watch it's an RTSP URL with the password in it
         raise RuntimeError("ffprobe found no video stream (unreachable stream, wrong password, "
