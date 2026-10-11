@@ -50,7 +50,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -535,10 +536,15 @@ class NvrCameraJob:
     def __init__(self, cam, store, chunks, q, args, stats, gate):
         self.cam, self.store, self.chunks, self.q = cam, store, chunks, q
         self.args, self.stats, self.gate = args, stats, gate
-        self.status = {"state": "starting"}   # set by the download thread, shown on the progress bar
+        self.status = {"state": "starting"}   # set by the download threads, shown on the progress bar
+        self.active = {}                      # chunk start -> its download state
+        self.active_lock = threading.Lock()
         self.bar = None
         self.on_progress = None
-        self.ready = queue.Queue(maxsize=args.prefetch)
+        self.ready = queue.Queue()
+        # chunks in flight or downloaded but not yet decoded; the decoder frees one
+        # per chunk, so at most this many chunk files sit in .chunks at once
+        self.ahead = threading.Semaphore(args.prefetch + 1)
         self.tmp = store.dir / ".chunks"
         self.tmp.mkdir(exist_ok=True)
         # Dahua can send I-frames only (DESIGN.md "Keyframe-only download"):
@@ -549,49 +555,85 @@ class NvrCameraJob:
         threading.Thread(target=self._download_all, daemon=True).start()
         threading.Thread(target=self._decode_all, daemon=True).start()
 
+    def _set_state(self, cs, text):
+        """Record one chunk's download state (None = finished) and show the
+        earliest active chunk's on the progress bar."""
+        with self.active_lock:
+            if text is None:
+                self.active.pop(cs, None)
+            else:
+                self.active[cs] = text
+            if self.active:
+                first = min(self.active)
+                more = f" (+{len(self.active) - 1} more)" if len(self.active) > 1 else ""
+                self.status["state"] = self.active[first] + more
+            else:
+                self.status["state"] = "downloaded ahead, waiting for detector"
+
     def _download_all(self):
-        ext = ".dav" if self.cam.cfg["vendor"] == "dahua" else ".mp4"
-        for cs, ce in self.chunks:
-            # either direction: a chunk ending near "now" may not be fully recorded yet
-            wait = _ts(ce) + SETTLE_S - _ts(datetime.now())
-            if wait > 0:
-                self.status["state"] = f"waiting for NVR to finish recording {ce:%H:%M}"
-                time.sleep(wait)
-            dst = self.tmp / f"{cs:%Y%m%d-%H%M%S}{ext}"
-            what = "keyframes" if self.keyframes else "downloading"
-            fetch = self.cam.download_keyframes if self.keyframes else self.cam.download
-            # position in scan order: the camera furthest behind gets the next slot
-            priority = _ts(cs) if self.args.direction == "forward" else -_ts(cs)
-            result = False
-            for attempt in range(DOWNLOAD_RETRIES + 1):
-                self.status["state"] = f"waiting for NVR slot {cs:%H:%M}-{ce:%H:%M}"
-                self.gate.acquire(priority)
-                self.status["state"] = f"{what} {cs:%H:%M}-{ce:%H:%M}"
-                try:
-                    result = fetch(cs, ce, str(dst), timeout=self.args.chunk_timeout)
-                except Exception as e:  # SDK hiccup: retry like a failed download
-                    _log(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
-                    result = False
-                finally:
-                    self.gate.release()
-                if result is not False:
-                    break
-                if attempt < DOWNLOAD_RETRIES:
-                    self.status["state"] = f"retrying {cs:%H:%M} ({attempt + 1}/{DOWNLOAD_RETRIES})"
-                    time.sleep(5 * 3 ** attempt)
-            # a keyframe-only file starts at the first keyframe >= cs, not at cs
-            base = cs
-            if result and self.keyframes:
-                import dahua_sdk  # on sys.path once nvr is imported
-                try:
-                    with open(dst, "rb") as f:
-                        base = dahua_sdk.dhav_time(f.read(24))
-                except (OSError, ValueError, struct.error) as e:
-                    _log(f"[{self.store.cam_id}] keyframe time {cs:%H:%M:%S} unreadable ({e}), using chunk start")
-            self.status["state"] = "downloaded ahead, waiting for detector"
-            self.ready.put((cs, ce, dst if result else None, result, base))
+        # Several chunks of one camera download at once (up to --prefetch + 1),
+        # since some NVRs cap each connection's speed (a Dahua NVR measured
+        # ~21Mbps per connection, adding up linearly across connections) -- one chunk at
+        # a time per camera left the NVR's --connections slots idle when there
+        # were fewer cameras than slots. Chunks still reach the decoder in order.
+        with ThreadPoolExecutor(max_workers=self.args.prefetch + 1) as pool:
+            pending = deque()
+            for cs, ce in self.chunks:
+                # a slot is freed by the decoder once a chunk is scanned; if every
+                # slot is held by a chunk not handed over yet, hand over the oldest
+                while not self.ahead.acquire(blocking=False):
+                    if not pending:
+                        self.ahead.acquire()
+                        break
+                    self.ready.put(pending.popleft().result())
+                pending.append(pool.submit(self._fetch_chunk, cs, ce))
+                while pending and pending[0].done():
+                    self.ready.put(pending.popleft().result())
+            while pending:
+                self.ready.put(pending.popleft().result())
         self.status["state"] = "all downloaded"
         self.ready.put(None)
+
+    def _fetch_chunk(self, cs, ce):
+        ext = ".dav" if self.cam.cfg["vendor"] == "dahua" else ".mp4"
+        # either direction: a chunk ending near "now" may not be fully recorded yet
+        wait = _ts(ce) + SETTLE_S - _ts(datetime.now())
+        if wait > 0:
+            self._set_state(cs, f"waiting for NVR to finish recording {ce:%H:%M}")
+            time.sleep(wait)
+        dst = self.tmp / f"{cs:%Y%m%d-%H%M%S}{ext}"
+        what = "keyframes" if self.keyframes else "downloading"
+        fetch = self.cam.download_keyframes if self.keyframes else self.cam.download
+        # position in scan order: the camera furthest behind gets the next slot
+        priority = _ts(cs) if self.args.direction == "forward" else -_ts(cs)
+        result = False
+        for attempt in range(DOWNLOAD_RETRIES + 1):
+            self._set_state(cs, f"waiting for NVR slot {cs:%H:%M}-{ce:%H:%M}")
+            self.gate.acquire(priority)
+            self._set_state(cs, f"{what} {cs:%H:%M}-{ce:%H:%M}")
+            try:
+                result = fetch(cs, ce, str(dst), timeout=self.args.chunk_timeout)
+            except Exception as e:  # SDK hiccup: retry like a failed download
+                _log(f"[{self.store.cam_id}] download {cs:%H:%M:%S} error: {e}")
+                result = False
+            finally:
+                self.gate.release()
+            if result is not False:
+                break
+            if attempt < DOWNLOAD_RETRIES:
+                self._set_state(cs, f"retrying {cs:%H:%M} ({attempt + 1}/{DOWNLOAD_RETRIES})")
+                time.sleep(5 * 3 ** attempt)
+        # a keyframe-only file starts at the first keyframe >= cs, not at cs
+        base = cs
+        if result and self.keyframes:
+            import dahua_sdk  # on sys.path once nvr is imported
+            try:
+                with open(dst, "rb") as f:
+                    base = dahua_sdk.dhav_time(f.read(24))
+            except (OSError, ValueError, struct.error) as e:
+                _log(f"[{self.store.cam_id}] keyframe time {cs:%H:%M:%S} unreadable ({e}), using chunk start")
+        self._set_state(cs, None)
+        return cs, ce, dst if result else None, result, base
 
     def _decode_all(self):
         cam_id = self.store.cam_id
@@ -615,6 +657,7 @@ class NvrCameraJob:
                         except OSError:
                             pass
                 self.q.put(("mark", cam_id, lambda cs=cs, ce=ce, r=result, ok=ok: self._chunk_done(cs, ce, r, ok)))
+                self.ahead.release()
         finally:
             self.q.put(("done", cam_id))
 
@@ -890,7 +933,8 @@ def main(argv):
     p.add_argument("--connections", type=int, default=4,
                    help="Max concurrent downloads per NVR, shared fairly by its cameras "
                         "(default 4; some NVRs error under more).")
-    p.add_argument("--prefetch", type=int, default=2, help="Chunks downloaded ahead per camera (default 2).")
+    p.add_argument("--prefetch", type=int, default=2, help="Chunks downloaded ahead per camera (default 2). Up to this + 1 chunks "
+                        "of one camera download in parallel, still capped by --connections.")
     p.add_argument("--chunk-timeout", type=int, default=300, help="Seconds before a chunk download is abandoned.")
     p.add_argument("--full-download", action="store_true",
                    help="Dahua: download full footage instead of fetching keyframes only (the default for "
