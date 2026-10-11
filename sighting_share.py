@@ -2,11 +2,14 @@
 """
 sighting_share.py - copies each Sighting's picture into a destination
 folder as it is found, e.g. a Google Drive / OneDrive / LINE-synced folder
-to share live with someone else. Two versions of every picture:
+to share live with someone else. Three versions of every picture:
 
     <dest>/raw/       the clean keyframe from frames/ (nothing drawn on it)
     <dest>/overlay/   the same keyframe with the Region outline and the
                       Hit boxes, but no class/confidence text
+    <dest>/crop/      the clean keyframe cut down to the Hit boxes plus a
+                      margin (--crop-pad, at least --crop-min px a side),
+                      so a small, distant animal is visible on a phone
 
 The images/.index.json written by the scan says which frame each Sighting's
 picture was drawn from. Same input as the Sighting Wall (every camera
@@ -98,19 +101,40 @@ class Overlay:
         self.cache[camera] = (key, region, by_frame)
         return region, by_frame
 
-    def render(self, r):
-        frame = cv2.imread(str(r["frame_path"]))
-        if frame is None:
-            return None
-        region, by_frame = self._load(r["camera"])
+    def boxes(self, r):
+        _, by_frame = self._load(r["camera"])
+        return [list(map(int, h["box"])) for h in by_frame.get(r["frame"], [])
+                if h.get("target") == r["target"]]
+
+    def render(self, r, frame):
+        frame = frame.copy()
+        region, _ = self._load(r["camera"])
         if region:
             for shape in region["points"]:
                 cv2.polylines(frame, [np.array(shape, dtype=np.int32)], True, (0, 255, 255), 1)
-        for h in by_frame.get(r["frame"], []):
-            if h.get("target") == r["target"]:
-                x1, y1, x2, y2 = map(int, h["box"])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        for x1, y1, x2, y2 in self.boxes(r):
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
         return frame
+
+
+def crop(frame, boxes, pad, min_side):
+    """The part of `frame` around all `boxes`: their union grown by `pad` x
+    its longer side on every side, widened to at least `min_side` px each
+    way, and slid (not shrunk) to stay inside the frame. Whole frame when
+    there are no boxes."""
+    if not boxes:
+        return frame
+    fh, fw = frame.shape[:2]
+    x1, y1 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    x2, y2 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    m = pad * max(x2 - x1, y2 - y1)
+    out = []
+    for lo, hi, size in ((x1 - m, x2 + m, fw), (y1 - m, y2 + m, fh)):
+        side = min(size, max(hi - lo, min_side))
+        lo = min(max(0, (lo + hi - side) / 2), size - side)
+        out.append((int(lo), int(lo + side)))
+    (cx1, cx2), (cy1, cy2) = out
+    return frame[cy1:cy2, cx1:cx2]
 
 
 def _same_file(src, dest):
@@ -155,7 +179,7 @@ def _write(img, dest):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dest", required=True,
-                    help="Folder to copy Sighting pictures into; raw/ and overlay/ are created inside it.")
+                    help="Folder to copy Sighting pictures into; raw/, overlay/ and crop/ are created inside it.")
     ap.add_argument("--root", default=str(nvr_scan.default_root()),
                     help="Folder of camera folders (default: NVR_SCAN_ROOT in .env, else ./nvr_scans).")
     ap.add_argument("--camera", default="",
@@ -164,11 +188,16 @@ def main():
                     help="Only copy Sightings seen by Live Watch (source live or nvr+live).")
     ap.add_argument("--all", action="store_true",
                     help="Also copy Sightings that ended before this script started.")
+    ap.add_argument("--crop-pad", type=float, default=1.0,
+                    help="crop/ margin on every side, as a multiple of the boxes' longer side (default 1.0).")
+    ap.add_argument("--crop-min", type=int, default=480,
+                    help="crop/ is at least this many px wide and tall (default 480), for context around tiny Hits.")
     ap.add_argument("--interval", type=float, default=2.0, help="Seconds between checks for new Sightings.")
     args = ap.parse_args()
 
-    raw_dir, overlay_dir = Path(args.dest) / "raw", Path(args.dest) / "overlay"
-    for d in (raw_dir, overlay_dir):
+    dest = Path(args.dest)
+    raw_dir, overlay_dir, crop_dir = dest / "raw", dest / "overlay", dest / "crop"
+    for d in (raw_dir, overlay_dir, crop_dir):
         d.mkdir(parents=True, exist_ok=True)
     # Accept object_scan's "hik1:3" form as well as the folder name "hik1_ch3".
     cameras = {c.strip().replace(":", "_ch") for c in args.camera.split(",") if c.strip()}
@@ -178,9 +207,9 @@ def main():
                   flush=True)
     since = None if args.all else datetime.now().replace(microsecond=0)
     overlay = Overlay(args.root)
-    done = {}                # file name -> frame name both versions were made from
+    done = {}                # file name -> frame name every version was made from
     print(f"[sighting-share] {Path(args.root).resolve()} -> {Path(args.dest).resolve()} "
-          f"(raw/ + overlay/) -- Ctrl+C to stop", flush=True)
+          f"(raw/ + overlay/ + crop/) -- Ctrl+C to stop", flush=True)
     try:
         while True:
             for r in _sightings(args.root, cameras):
@@ -191,12 +220,17 @@ def main():
                 name = r["name"]
                 if done.get(name) == r["frame"]:
                     continue
-                raw_out, overlay_out = raw_dir / name, overlay_dir / name
-                if name not in done and _same_file(r["frame_path"], raw_out) and overlay_out.exists():
+                raw_out, overlay_out, crop_out = raw_dir / name, overlay_dir / name, crop_dir / name
+                if (name not in done and _same_file(r["frame_path"], raw_out)
+                        and overlay_out.exists() and crop_out.exists()):
                     done[name] = r["frame"]      # already copied by an earlier run
                     continue
-                img = overlay.render(r)
-                if img is None or not _write(img, overlay_out) or not _copy(r["frame_path"], raw_out):
+                frame = cv2.imread(str(r["frame_path"]))
+                if frame is None:
+                    continue
+                cut = crop(frame, overlay.boxes(r), args.crop_pad, args.crop_min)
+                if (not _write(overlay.render(r, frame), overlay_out) or not _write(cut, crop_out)
+                        or not _copy(r["frame_path"], raw_out)):
                     continue
                 print(f"[sighting-share] {'updated' if name in done else 'new'}: {name}", flush=True)
                 done[name] = r["frame"]
