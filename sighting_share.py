@@ -2,11 +2,16 @@
 """
 sighting_share.py - copies each Sighting's picture into a destination
 folder as it is found, e.g. a Google Drive / OneDrive / LINE-synced folder
-to share live with someone else. Two versions of every picture:
+to share live with someone else. Three versions of every picture:
 
     <dest>/raw/       the clean keyframe from frames/ (nothing drawn on it)
     <dest>/overlay/   the same keyframe with the Region outline and the
                       Hit boxes, but no class/confidence text
+    <dest>/crop/      the clean keyframe cut down to the Hit boxes plus a
+                      margin (--crop-pad, at least --crop-min px a side),
+                      so a small, distant animal is visible on a phone;
+                      Hits far enough apart that their crops don't overlap
+                      get one file each (<name>-1.jpg, -2, ... left to right)
 
 The images/.index.json written by the scan says which frame each Sighting's
 picture was drawn from. Same input as the Sighting Wall (every camera
@@ -98,19 +103,77 @@ class Overlay:
         self.cache[camera] = (key, region, by_frame)
         return region, by_frame
 
-    def render(self, r):
-        frame = cv2.imread(str(r["frame_path"]))
-        if frame is None:
-            return None
-        region, by_frame = self._load(r["camera"])
+    def boxes(self, r):
+        _, by_frame = self._load(r["camera"])
+        return [list(map(int, h["box"])) for h in by_frame.get(r["frame"], [])
+                if h.get("target") == r["target"]]
+
+    def render(self, r, frame):
+        frame = frame.copy()
+        region, _ = self._load(r["camera"])
         if region:
             for shape in region["points"]:
                 cv2.polylines(frame, [np.array(shape, dtype=np.int32)], True, (0, 255, 255), 1)
-        for h in by_frame.get(r["frame"], []):
-            if h.get("target") == r["target"]:
-                x1, y1, x2, y2 = map(int, h["box"])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        for x1, y1, x2, y2 in self.boxes(r):
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
         return frame
+
+
+def _window(box, pad, min_side, fw, fh):
+    """`box` grown by `pad` x its longer side on every side, widened to at
+    least `min_side` px each way, and slid (not shrunk) to stay inside the
+    frame."""
+    x1, y1, x2, y2 = box
+    m = pad * max(x2 - x1, y2 - y1)
+    out = []
+    for lo, hi, size in ((x1 - m, x2 + m, fw), (y1 - m, y2 + m, fh)):
+        side = min(size, max(hi - lo, min_side))
+        lo = min(max(0, (lo + hi - side) / 2), size - side)
+        out.append((int(lo), int(lo + side)))
+    (cx1, cx2), (cy1, cy2) = out
+    return cx1, cy1, cx2, cy2
+
+
+def _overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def crops(frame, boxes, pad, min_side):
+    """Cut-outs of `frame` around `boxes`, left to right. Boxes whose crop
+    windows overlap are merged (window of their union) until none overlap,
+    so animals close together share one picture and far-apart ones get
+    their own. The whole frame when there are no boxes."""
+    if not boxes:
+        return [frame]
+    fh, fw = frame.shape[:2]
+    groups = [list(b) for b in boxes]
+    merged = True
+    while merged:
+        merged = False
+        wins = [_window(g, pad, min_side, fw, fh) for g in groups]
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                if _overlap(wins[i], wins[j]):
+                    a, b = groups[i], groups.pop(j)
+                    groups[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    merged = True
+                    break
+            if merged:
+                break
+    wins = sorted(_window(g, pad, min_side, fw, fh) for g in groups)
+    return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in wins]
+
+
+def _crop_names(name, n):
+    stem = name[:-len(".jpg")]
+    return [name] if n == 1 else [f"{stem}-{i}.jpg" for i in range(1, n + 1)]
+
+
+def _old_crops(crop_dir, name):
+    """crop/ files already written for this Sighting: <name> or <stem>-<n>.jpg."""
+    stem = name[:-len(".jpg")]
+    return [p for p in crop_dir.glob(f"{stem}*.jpg")
+            if p.name == name or p.name[len(stem) + 1:-len(".jpg")].isdigit()]
 
 
 def _same_file(src, dest):
@@ -155,7 +218,7 @@ def _write(img, dest):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dest", required=True,
-                    help="Folder to copy Sighting pictures into; raw/ and overlay/ are created inside it.")
+                    help="Folder to copy Sighting pictures into; raw/, overlay/ and crop/ are created inside it.")
     ap.add_argument("--root", default=str(nvr_scan.default_root()),
                     help="Folder of camera folders (default: NVR_SCAN_ROOT in .env, else ./nvr_scans).")
     ap.add_argument("--camera", default="",
@@ -164,11 +227,16 @@ def main():
                     help="Only copy Sightings seen by Live Watch (source live or nvr+live).")
     ap.add_argument("--all", action="store_true",
                     help="Also copy Sightings that ended before this script started.")
+    ap.add_argument("--crop-pad", type=float, default=0.5,
+                    help="crop/ margin on every side, as a multiple of the boxes' longer side (default 0.5).")
+    ap.add_argument("--crop-min", type=int, default=150,
+                    help="crop/ is at least this many px wide and tall (default 150), for context around tiny Hits.")
     ap.add_argument("--interval", type=float, default=2.0, help="Seconds between checks for new Sightings.")
     args = ap.parse_args()
 
-    raw_dir, overlay_dir = Path(args.dest) / "raw", Path(args.dest) / "overlay"
-    for d in (raw_dir, overlay_dir):
+    dest = Path(args.dest)
+    raw_dir, overlay_dir, crop_dir = dest / "raw", dest / "overlay", dest / "crop"
+    for d in (raw_dir, overlay_dir, crop_dir):
         d.mkdir(parents=True, exist_ok=True)
     # Accept object_scan's "hik1:3" form as well as the folder name "hik1_ch3".
     cameras = {c.strip().replace(":", "_ch") for c in args.camera.split(",") if c.strip()}
@@ -178,9 +246,9 @@ def main():
                   flush=True)
     since = None if args.all else datetime.now().replace(microsecond=0)
     overlay = Overlay(args.root)
-    done = {}                # file name -> frame name both versions were made from
+    done = {}                # file name -> frame name every version was made from
     print(f"[sighting-share] {Path(args.root).resolve()} -> {Path(args.dest).resolve()} "
-          f"(raw/ + overlay/) -- Ctrl+C to stop", flush=True)
+          f"(raw/ + overlay/ + crop/) -- Ctrl+C to stop", flush=True)
     try:
         while True:
             for r in _sightings(args.root, cameras):
@@ -192,12 +260,22 @@ def main():
                 if done.get(name) == r["frame"]:
                     continue
                 raw_out, overlay_out = raw_dir / name, overlay_dir / name
-                if name not in done and _same_file(r["frame_path"], raw_out) and overlay_out.exists():
+                if (name not in done and _same_file(r["frame_path"], raw_out)
+                        and overlay_out.exists() and _old_crops(crop_dir, name)):
                     done[name] = r["frame"]      # already copied by an earlier run
                     continue
-                img = overlay.render(r)
-                if img is None or not _write(img, overlay_out) or not _copy(r["frame_path"], raw_out):
+                frame = cv2.imread(str(r["frame_path"]))
+                if frame is None:
                     continue
+                cuts = crops(frame, overlay.boxes(r), args.crop_pad, args.crop_min)
+                crop_outs = [crop_dir / n for n in _crop_names(name, len(cuts))]
+                stale = [p for p in _old_crops(crop_dir, name) if p not in crop_outs]
+                if (not _write(overlay.render(r, frame), overlay_out)
+                        or not all(_write(c, p) for c, p in zip(cuts, crop_outs))
+                        or not _copy(r["frame_path"], raw_out)):
+                    continue
+                for p in stale:      # the new picture split into fewer crops
+                    _discard(p)
                 print(f"[sighting-share] {'updated' if name in done else 'new'}: {name}", flush=True)
                 done[name] = r["frame"]
             time.sleep(args.interval)
