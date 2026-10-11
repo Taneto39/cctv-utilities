@@ -188,10 +188,10 @@ def main():
                     help="Only copy Sightings seen by Live Watch (source live or nvr+live).")
     ap.add_argument("--all", action="store_true",
                     help="Also copy Sightings that ended before this script started.")
-    ap.add_argument("--crop-pad", type=float, default=1.0,
-                    help="crop/ margin on every side, as a multiple of the boxes' longer side (default 1.0).")
-    ap.add_argument("--crop-min", type=int, default=480,
-                    help="crop/ is at least this many px wide and tall (default 480), for context around tiny Hits.")
+    ap.add_argument("--crop-pad", type=float, default=0.5,
+                    help="crop/ margin on every side, as a multiple of the boxes' longer side (default 0.5).")
+    ap.add_argument("--crop-min", type=int, default=150,
+                    help="crop/ is at least this many px wide and tall (default 150), for context around tiny Hits.")
     ap.add_argument("--interval", type=float, default=2.0, help="Seconds between checks for new Sightings.")
     args = ap.parse_args()
 
