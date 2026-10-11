@@ -9,7 +9,9 @@ to share live with someone else. Three versions of every picture:
                       Hit boxes, but no class/confidence text
     <dest>/crop/      the clean keyframe cut down to the Hit boxes plus a
                       margin (--crop-pad, at least --crop-min px a side),
-                      so a small, distant animal is visible on a phone
+                      so a small, distant animal is visible on a phone;
+                      Hits far enough apart that their crops don't overlap
+                      get one file each (<name>-1.jpg, -2, ... left to right)
 
 The images/.index.json written by the scan says which frame each Sighting's
 picture was drawn from. Same input as the Sighting Wall (every camera
@@ -117,16 +119,11 @@ class Overlay:
         return frame
 
 
-def crop(frame, boxes, pad, min_side):
-    """The part of `frame` around all `boxes`: their union grown by `pad` x
-    its longer side on every side, widened to at least `min_side` px each
-    way, and slid (not shrunk) to stay inside the frame. Whole frame when
-    there are no boxes."""
-    if not boxes:
-        return frame
-    fh, fw = frame.shape[:2]
-    x1, y1 = min(b[0] for b in boxes), min(b[1] for b in boxes)
-    x2, y2 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+def _window(box, pad, min_side, fw, fh):
+    """`box` grown by `pad` x its longer side on every side, widened to at
+    least `min_side` px each way, and slid (not shrunk) to stay inside the
+    frame."""
+    x1, y1, x2, y2 = box
     m = pad * max(x2 - x1, y2 - y1)
     out = []
     for lo, hi, size in ((x1 - m, x2 + m, fw), (y1 - m, y2 + m, fh)):
@@ -134,7 +131,49 @@ def crop(frame, boxes, pad, min_side):
         lo = min(max(0, (lo + hi - side) / 2), size - side)
         out.append((int(lo), int(lo + side)))
     (cx1, cx2), (cy1, cy2) = out
-    return frame[cy1:cy2, cx1:cx2]
+    return cx1, cy1, cx2, cy2
+
+
+def _overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def crops(frame, boxes, pad, min_side):
+    """Cut-outs of `frame` around `boxes`, left to right. Boxes whose crop
+    windows overlap are merged (window of their union) until none overlap,
+    so animals close together share one picture and far-apart ones get
+    their own. The whole frame when there are no boxes."""
+    if not boxes:
+        return [frame]
+    fh, fw = frame.shape[:2]
+    groups = [list(b) for b in boxes]
+    merged = True
+    while merged:
+        merged = False
+        wins = [_window(g, pad, min_side, fw, fh) for g in groups]
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                if _overlap(wins[i], wins[j]):
+                    a, b = groups[i], groups.pop(j)
+                    groups[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    merged = True
+                    break
+            if merged:
+                break
+    wins = sorted(_window(g, pad, min_side, fw, fh) for g in groups)
+    return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in wins]
+
+
+def _crop_names(name, n):
+    stem = name[:-len(".jpg")]
+    return [name] if n == 1 else [f"{stem}-{i}.jpg" for i in range(1, n + 1)]
+
+
+def _old_crops(crop_dir, name):
+    """crop/ files already written for this Sighting: <name> or <stem>-<n>.jpg."""
+    stem = name[:-len(".jpg")]
+    return [p for p in crop_dir.glob(f"{stem}*.jpg")
+            if p.name == name or p.name[len(stem) + 1:-len(".jpg")].isdigit()]
 
 
 def _same_file(src, dest):
@@ -220,18 +259,23 @@ def main():
                 name = r["name"]
                 if done.get(name) == r["frame"]:
                     continue
-                raw_out, overlay_out, crop_out = raw_dir / name, overlay_dir / name, crop_dir / name
+                raw_out, overlay_out = raw_dir / name, overlay_dir / name
                 if (name not in done and _same_file(r["frame_path"], raw_out)
-                        and overlay_out.exists() and crop_out.exists()):
+                        and overlay_out.exists() and _old_crops(crop_dir, name)):
                     done[name] = r["frame"]      # already copied by an earlier run
                     continue
                 frame = cv2.imread(str(r["frame_path"]))
                 if frame is None:
                     continue
-                cut = crop(frame, overlay.boxes(r), args.crop_pad, args.crop_min)
-                if (not _write(overlay.render(r, frame), overlay_out) or not _write(cut, crop_out)
+                cuts = crops(frame, overlay.boxes(r), args.crop_pad, args.crop_min)
+                crop_outs = [crop_dir / n for n in _crop_names(name, len(cuts))]
+                stale = [p for p in _old_crops(crop_dir, name) if p not in crop_outs]
+                if (not _write(overlay.render(r, frame), overlay_out)
+                        or not all(_write(c, p) for c, p in zip(cuts, crop_outs))
                         or not _copy(r["frame_path"], raw_out)):
                     continue
+                for p in stale:      # the new picture split into fewer crops
+                    _discard(p)
                 print(f"[sighting-share] {'updated' if name in done else 'new'}: {name}", flush=True)
                 done[name] = r["frame"]
             time.sleep(args.interval)

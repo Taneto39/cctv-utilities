@@ -229,7 +229,8 @@ python sighting_wall.py
 
 # copy each new Sighting picture into a folder to share (e.g. a synced cloud folder):
 # <dest>/raw/ clean frame, <dest>/overlay/ with boxes (no labels), <dest>/crop/ clean frame cut
-# around the boxes (--crop-pad 0.5 x box size each side, at least --crop-min 150px), named <date>-<time>-<camera>.jpg
+# around the boxes (--crop-pad 0.5 x box size each side, at least --crop-min 150px; far-apart boxes
+# get one crop each, -1/-2/... left to right), named <date>-<time>-<camera>.jpg
 python sighting_share.py --dest /path/to/shared --live-only
 ```
 
