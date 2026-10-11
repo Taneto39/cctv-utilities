@@ -246,6 +246,12 @@ Hikvision NVRs send every frame (no keyframe-only option was found in
 HCNetSDK, RTSP playback or ONVIF replay), so they always download in full.
 Live timestamps lag the burned-in clock by a few seconds.
 
+Each camera downloads up to `--prefetch` + 1 chunks (default 3) at once, and
+`--connections` (default 4) caps concurrent downloads per NVR. Some NVRs
+limit each connection's speed but not the total, so with few cameras raise
+`--connections` (e.g. `--connections 8` for 3 cameras) to use more
+connections in parallel.
+
 ## censor.py / select_region.py
 
 Separate from the pipeline above: hides a region in every clip of a flat
