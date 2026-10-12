@@ -2,7 +2,9 @@
 # object_scan.py run, NVR/Live Watch decode). Without them NVR decode fails
 # with "[WinError 2] The system cannot find the file specified". In a conda
 # env (conda-forge build has -hwaccel cuda and the dhav demuxer for Dahua):
-#   conda install -c conda-forge ffmpeg
+#   conda install -c conda-forge "ffmpeg>=8,<9"
+# Capped below 9 when the env is shared with projects that use torchaudio:
+# torchcodec (torchaudio.load's decoder) only loads FFmpeg 4-8.
 
 # Core -- motion_scan.py, rename scripts
 opencv-python
