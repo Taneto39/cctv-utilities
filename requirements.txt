@@ -16,3 +16,8 @@ ultralytics
 # several workers share one GPU (see CLAUDE.md/DESIGN.md). If you want to
 # re-test on different hardware:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# NVR source / Live Watch (object_scan.py nvr|live, Windows only) also needs
+# the shared nvr-sdk folder's own requirements (Dahua NetSDK wheel) --
+# from <NVR_SDK_DIR>:
+#   pip install -r requirements.txt
