@@ -1,3 +1,9 @@
+# Not pip-installable: ffmpeg + ffprobe must be on PATH (codec work, every
+# object_scan.py run, NVR/Live Watch decode). Without them NVR decode fails
+# with "[WinError 2] The system cannot find the file specified". In a conda
+# env (conda-forge build has -hwaccel cuda and the dhav demuxer for Dahua):
+#   conda install -c conda-forge ffmpeg
+
 # Core -- motion_scan.py, rename scripts
 opencv-python
 numpy
@@ -16,3 +22,8 @@ ultralytics
 # several workers share one GPU (see CLAUDE.md/DESIGN.md). If you want to
 # re-test on different hardware:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# NVR source / Live Watch (object_scan.py nvr|live, Windows only) also needs
+# the shared nvr-sdk folder's own requirements (Dahua NetSDK wheel) --
+# from <NVR_SDK_DIR>:
+#   pip install -r requirements.txt
