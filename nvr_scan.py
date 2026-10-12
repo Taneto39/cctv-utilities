@@ -70,10 +70,138 @@ DOWNLOAD_RETRIES = 3
 LIVE_FLUSH_S = 3.0
 
 
-def _log(msg):
-    """print() that doesn't tear the per-camera progress bars."""
-    from tqdm import tqdm
-    tqdm.write(msg)
+def _enable_vt(stream):
+    """Turn on ANSI escape handling for a Windows console (needed for the
+    cursor moves StatusBoard uses); True if the stream can take them."""
+    if not stream.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+        return False
+    return bool(k32.SetConsoleMode(h, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+class StatusBoard:
+    """A block of status lines redrawn in place at the bottom of the
+    terminal, with log lines printed above it. Replaces one tqdm bar per
+    camera: those wrapped or overran the screen with many cameras (every
+    redraw moved the cursor by the wrong number of rows, so lines piled up
+    on top of each other). Here every line is clipped to the terminal width
+    and the block to its height, and every other write -- print(), the SDK
+    wrappers' [DBG] lines, warnings -- goes through the board while it's open."""
+
+    def __init__(self, render_lines):
+        self.render_lines = render_lines   # () -> [str], first line is the summary
+        self.real = sys.stdout
+        self.lock = threading.RLock()
+        self.drawn = 0
+        self.partial = ""
+        self.live = _enable_vt(self.real)
+        self.saved = None
+
+    def open(self):
+        self.saved = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = _BoardStream(self)
+        self.render()
+        return self
+
+    def close(self):
+        with self.lock:
+            if self.saved is None:
+                return
+            if self.partial:
+                self._emit(self.partial)
+                self.partial = ""
+            self.render()
+            if self.live and self.drawn:
+                self.real.write("\n")   # leave the final block on screen
+                self.real.flush()
+            self.drawn = 0
+            sys.stdout, sys.stderr = self.saved
+            self.saved = None
+
+    def _clear(self):
+        if self.live and self.drawn:
+            # back to the block's first line, then erase to the end of the screen
+            self.real.write(f"\r\x1b[{self.drawn - 1}A\x1b[J" if self.drawn > 1 else "\r\x1b[J")
+        self.drawn = 0
+
+    def _emit(self, line):
+        self._clear()
+        self.real.write(line + "\n")
+        self._draw()
+
+    def write(self, text):
+        with self.lock:
+            self.partial += text
+            *lines, self.partial = self.partial.split("\n")
+            for line in lines:
+                self._emit(line)
+            if lines:
+                self.real.flush()
+
+    def log(self, msg):
+        self.write(f"{msg}\n")
+
+    def render(self):
+        with self.lock:
+            self._clear()
+            self._draw()
+            self.real.flush()
+
+    def _draw(self):
+        if not self.live or self.saved is None:
+            return
+        size = os.get_terminal_size(self.real.fileno()) if self.real.isatty() else os.terminal_size((120, 40))
+        width = max(20, size.columns - 1)   # never fill the last column: some consoles wrap there
+        lines = self.render_lines()
+        room = max(2, size.lines - 2)
+        if len(lines) > room:
+            hidden = len(lines) - (room - 1)
+            lines = lines[:room - 1] + [f"... {hidden} more camera(s) -- widen/heighten the terminal to see them"]
+        self.real.write("\n".join(line[:width] for line in lines))
+        self.drawn = len(lines)
+
+
+class _BoardStream:
+    """sys.stdout/sys.stderr stand-in that routes writes through a StatusBoard."""
+
+    def __init__(self, board):
+        self.board = board
+
+    def write(self, text):
+        self.board.write(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False   # keep other libraries from drawing their own progress bars
+
+    def __getattr__(self, name):
+        return getattr(self.board.real, name)
+
+
+_board = None
+_quiet = threading.Event()   # set on Ctrl+C: download threads still winding down shouldn't print
+
+
+def _log(*args, **kwargs):
+    """print() that goes above the status board (also patched in as the SDK
+    wrappers' print, so it takes print()'s arguments)."""
+    if _quiet.is_set():
+        return
+    msg = " ".join(str(a) for a in args)
+    if _board is not None:
+        _board.log(msg)
+    else:
+        print(msg, flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -547,6 +675,12 @@ class NvrCameraJob:
         self.ahead = threading.Semaphore(args.prefetch + 1)
         self.tmp = store.dir / ".chunks"
         self.tmp.mkdir(exist_ok=True)
+        # half-downloaded chunks left by a run stopped with Ctrl+C
+        for leftover in self.tmp.iterdir():
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
         # Dahua can send I-frames only (DESIGN.md "Keyframe-only download"):
         # same keyframes, ~2x fewer bytes, exact wall-clock time per frame
         self.keyframes = getattr(cam, "supports_keyframes", False) and not args.full_download
@@ -677,8 +811,22 @@ class NvrCameraJob:
         self.store.write_outputs(self.args.gap)
 
 
+def _close_cameras(cams, timeout=None):
+    """Log every camera out of its NVR. With a timeout (Ctrl+C), give up
+    waiting after that many seconds: an SDK logout can block while a
+    download on the same login is still running."""
+    def close_all():
+        for cam in cams:
+            try:
+                cam.close()
+            except Exception:
+                pass
+    t = threading.Thread(target=close_all, daemon=True)
+    t.start()
+    t.join(timeout)
+
+
 def run_nvr(args):
-    from tqdm import tqdm
     nvr = import_nvr()
     now = datetime.now().replace(microsecond=0)
     start = parse_from(args.start, now)
@@ -726,21 +874,48 @@ def run_nvr(args):
           + "".join(f"\n  {c}: {stats[c]['skipped']} chunk(s) already scanned" for c in cams if stats[c]["skipped"]))
 
     t0 = time.time()
-    bars = []
-    try:
-        # one bar for everything, then one per camera showing how far into the
+    done = {"all": 0.0}
+    for cam_id, job in jobs:
+        job.total_s = sum((ce - cs).total_seconds() for cs, ce in job.chunks)
+        done[cam_id] = 0.0
+
+    def progress(cam_id, sec):
+        done[cam_id] += sec
+        done["all"] += sec
+
+    width = max([len(c) for c in cams] + [3])
+
+    def bar(frac, n=20):
+        k = int(round(max(0.0, min(1.0, frac)) * n))
+        return "#" * k + "-" * (n - k)
+
+    def hms(s):
+        s = int(s)
+        return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
+
+    def status_lines():
+        # one line for everything, then one per camera showing how far into the
         # footage it has got (wall-clock time of the last keyframe scanned)
-        width = max([len(c) for c in cams] + [3])
-        overall = tqdm(total=round(total_s), desc="all".ljust(width), dynamic_ncols=True, position=0,
-                       bar_format="{desc} {bar:20} {percentage:3.0f}% {n:.0f}/{total:.0f}s footage "
-                                  "[{elapsed}<{remaining}]")
-        bars.append(overall)
-        for i, (cam_id, job) in enumerate(jobs, start=1):
-            cam_s = sum((ce - cs).total_seconds() for cs, ce in job.chunks)
-            job.bar = tqdm(total=round(cam_s), desc=cam_id.ljust(width), dynamic_ncols=True, position=i,
-                           bar_format="{desc} {bar:20} {percentage:3.0f}% | {postfix[0]}", postfix=["at - | starting"])
-            bars.append(job.bar)
-            job.on_progress = (lambda bar: lambda sec: (bar.update(sec), overall.update(sec)))(job.bar)
+        elapsed = time.time() - t0
+        frac = done["all"] / total_s if total_s else 1.0
+        eta = hms(elapsed * (total_s - done["all"]) / done["all"]) if done["all"] else "?"
+        lines = [f"{'all'.ljust(width)} [{bar(frac)}] {frac:4.0%} {done['all']:.0f}/{total_s:.0f}s footage "
+                 f"| {hms(elapsed)} elapsed, ~{eta} left | {det.n_frames} keyframes, hits {sum(det.n_hits.values())}"]
+        for cam_id, job in jobs:
+            frac = done[cam_id] / job.total_s if job.total_s else 1.0
+            at = det.last_t.get(cam_id)
+            state = "done" if frac >= 1 else job.status["state"]
+            lines.append(f"{cam_id.ljust(width)} [{bar(frac)}] {frac:4.0%} | at {f'{at:%m-%d %H:%M:%S}' if at else '-':14} "
+                         f"| hits {det.n_hits[cam_id]:<4} | {state}")
+        return lines
+
+    global _board
+    _board = StatusBoard(status_lines)
+    interrupted = False
+    try:
+        _board.open()
+        for cam_id, job in jobs:
+            job.on_progress = (lambda c: lambda sec: progress(c, sec))(cam_id)
             job.start()
         last_tick = [0.0]
 
@@ -748,14 +923,7 @@ def run_nvr(args):
             if not force and time.time() - last_tick[0] < 0.5:
                 return
             last_tick[0] = time.time()
-            for cam_id, job in jobs:
-                at = det.last_t.get(cam_id)
-                at_s = f"at {at:%m-%d %H:%M:%S}" if at else "at -"
-                state = "done" if job.bar.n >= job.bar.total else job.status["state"]
-                # a list, not a str: tqdm would prefix a str postfix with ", "
-                job.bar.postfix = [f"{at_s} | hits {det.n_hits[cam_id]} | {state}"]
-                job.bar.refresh()
-            overall.refresh()
+            _board.render()
 
         # Sightings are rebuilt after every chunk anyway; also rebuild (throttled)
         # as soon as a Hit lands, so the Sighting Wall shows it without
@@ -771,11 +939,25 @@ def run_nvr(args):
 
         det.run(q, len(jobs), on_hits=lambda cam_id: (dirty.add(cam_id), flush()), idle=flush, tick=tick)
         tick(force=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        # downloads still in flight fail once their camera logs out below; their
+        # [DBG]/retry lines would only bury the summary
+        _quiet.set()
     finally:
-        for bar in reversed(bars):
-            bar.close()
-        for cam in cams.values():
-            cam.close()
+        _board.close()
+        _board = None
+        _close_cameras(cams.values(), timeout=5 if interrupted else None)
+    if interrupted:
+        print("\n[object-scan nvr] stopped (Ctrl+C). Finished chunks are saved -- run the same command "
+              "again to continue from where it stopped.")
+        for cam_id, store in stores.items():
+            store.write_outputs(args.gap)
+            print(f"  {cam_id}: {stats[cam_id]['ok']} chunk(s) scanned this run")
+        sys.stdout.flush()
+        # skip joining the download threads: each would sit in its SDK call
+        # until the chunk finishes or times out (--chunk-timeout, minutes)
+        os._exit(130)
     elapsed = time.time() - t0
     if det.n_frames:
         print(f"[object-scan nvr] {det.n_frames} keyframes in {elapsed:.0f}s "
@@ -953,7 +1135,11 @@ def main(argv):
     if args.cmd == "nvr":
         if args.direction == "forward" and args.end != "1h":
             print("[object-scan nvr] --end only applies to --direction backward; ignored.")
-        run_nvr(args)
+        try:
+            run_nvr(args)
+        except KeyboardInterrupt:   # before scanning started (login, model load)
+            print("\n[object-scan nvr] stopped (Ctrl+C).", flush=True)
+            os._exit(130)
     elif args.cmd == "live":
         run_live(args)
     else:
