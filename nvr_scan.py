@@ -101,6 +101,7 @@ class StatusBoard:
         self.lock = threading.RLock()
         self.drawn = 0
         self.partial = ""
+        self.last = None
         self.live = _enable_vt(self.real)
         self.saved = None
 
@@ -114,10 +115,9 @@ class StatusBoard:
         with self.lock:
             if self.saved is None:
                 return
-            if self.partial:
-                self._emit(self.partial)
-                self.partial = ""
-            self.render()
+            logs = [self.partial] if self.partial else []
+            self.partial = ""
+            self._paint(logs, force=True)
             if self.live and self.drawn:
                 self.real.write("\n")   # leave the final block on screen
                 self.real.flush()
@@ -125,47 +125,50 @@ class StatusBoard:
             sys.stdout, sys.stderr = self.saved
             self.saved = None
 
-    def _clear(self):
-        if self.live and self.drawn:
-            # back to the block's first line, then erase to the end of the screen
-            self.real.write(f"\r\x1b[{self.drawn - 1}A\x1b[J" if self.drawn > 1 else "\r\x1b[J")
-        self.drawn = 0
-
-    def _emit(self, line):
-        self._clear()
-        self.real.write(line + "\n")
-        self._draw()
-
     def write(self, text):
         with self.lock:
             self.partial += text
             *lines, self.partial = self.partial.split("\n")
-            for line in lines:
-                self._emit(line)
             if lines:
-                self.real.flush()
+                self._paint(lines)
 
     def log(self, msg):
         self.write(f"{msg}\n")
 
     def render(self):
         with self.lock:
-            self._clear()
-            self._draw()
-            self.real.flush()
+            self._paint()
 
-    def _draw(self):
+    def _paint(self, logs=(), force=False):
+        """Log lines (if any) then the block, in one write that overwrites the
+        previous block in place. Nothing is erased first -- erasing and then
+        redrawing made the whole block flicker -- each line just clears its own
+        leftover tail, and an unchanged block isn't redrawn at all."""
         if not self.live or self.saved is None:
+            for line in logs:
+                self.real.write(line + "\n")
+            self.real.flush()
             return
-        size = os.get_terminal_size(self.real.fileno()) if self.real.isatty() else os.terminal_size((120, 40))
+        size = os.get_terminal_size(self.real.fileno())
         width = max(20, size.columns - 1)   # never fill the last column: some consoles wrap there
         lines = self.render_lines()
         room = max(2, size.lines - 2)
         if len(lines) > room:
             hidden = len(lines) - (room - 1)
             lines = lines[:room - 1] + [f"... {hidden} more camera(s) -- widen/heighten the terminal to see them"]
-        self.real.write("\n".join(line[:width] for line in lines))
+        lines = [line[:width] for line in lines]
+        if not logs and not force and lines == self.last and self.drawn:
+            return
+        out = ["\x1b[?25l\r"]   # hide the cursor while drawing
+        if self.drawn > 1:
+            out.append(f"\x1b[{self.drawn - 1}A")
+        out += [line + "\x1b[K\n" for line in logs]
+        out.append("\n".join(line + "\x1b[K" for line in lines))
+        out.append("\x1b[J\x1b[?25h")   # drop rows left over if the block shrank
+        self.real.write("".join(out))
+        self.real.flush()
         self.drawn = len(lines)
+        self.last = lines
 
 
 class _BoardStream:
