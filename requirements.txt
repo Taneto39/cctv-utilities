@@ -1,3 +1,9 @@
+# Not pip-installable: ffmpeg + ffprobe must be on PATH (codec work, every
+# object_scan.py run, NVR/Live Watch decode). Without them NVR decode fails
+# with "[WinError 2] The system cannot find the file specified". In a conda
+# env (conda-forge build has -hwaccel cuda and the dhav demuxer for Dahua):
+#   conda install -c conda-forge ffmpeg
+
 # Core -- motion_scan.py, rename scripts
 opencv-python
 numpy
