@@ -183,7 +183,9 @@ def iter_keyframes(path, input_args=()):
     cmd = ["ffmpeg", "-hide_banner", "-nostats", "-v", "info", "-hwaccel", "cuda",
            "-skip_frame", "nokey", *input_args, "-i", str(path), "-an", "-sn", "-vf", "showinfo",
            "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # no stdin: ffmpeg would otherwise read the console for its hotkeys and
+    # change the console's input mode under the progress display
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     pts_q = queue.Queue()
 
     # stderr drained on its own thread, concurrently with stdout -- same
@@ -216,7 +218,7 @@ def grab_keyframe(path, offset):
     """The single keyframe at `offset` (same timebase as iter_keyframes)."""
     cmd = ["ffmpeg", "-v", "error", "-skip_frame", "nokey", "-ss", f"{max(0.0, offset - 0.5):.3f}",
            "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "bmp", "-"]
-    out = subprocess.run(cmd, capture_output=True).stdout
+    out = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True).stdout
     if not out:
         return None
     return cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
