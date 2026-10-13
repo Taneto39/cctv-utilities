@@ -15,9 +15,8 @@ tqdm
 # (pulls in torch automatically; comment out if you only need motion_scan.py)
 ultralytics
 
-# Optional: ~2.5x faster object_scan.py via a TensorRT engine (see README).
-# TensorRT 11 isn't supported by ultralytics' exporter yet.
-#   pip install "tensorrt-cu12>=10.8,<11"
+# Optional: ~2.5x faster object_scan.py via a TensorRT engine (see README):
+#   pip install -r requirements-trt.txt
 
 # Optional: GPU compute for motion_scan.py. NOT installed by default on
 # purpose -- benchmarked slower than --no-gpu on the dev machine once

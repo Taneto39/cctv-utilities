@@ -182,7 +182,7 @@ more at 0.30; another missed one (0.342 -> 0.297), losing a single-hit
 Sighting. Use `--no-trt` if that matters more than speed.
 
 ```bash
-pip install "tensorrt-cu12>=10.8,<11"
+pip install -r requirements-trt.txt
 ```
 
 - TensorRT 11 doesn't work yet: ultralytics' exporter still calls an API it
