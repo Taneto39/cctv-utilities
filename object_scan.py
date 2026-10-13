@@ -270,7 +270,7 @@ def region_distance(shapes, x, y):
 # Resume state
 # --------------------------------------------------------------------------
 
-TRT_INSTALL_HINT = 'pip install "tensorrt-cu12>=10.8,<11"'
+TRT_INSTALL_HINT = "pip install -r requirements-trt.txt"
 
 
 def _engine_batch(path):

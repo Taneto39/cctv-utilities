@@ -1,0 +1,6 @@
+# Optional: ~2.5x faster object_scan.py via a TensorRT FP16 engine (see README).
+# Install on top of requirements.txt:
+#   pip install -r requirements-trt.txt
+# Without it object_scan.py falls back to PyTorch, with a note.
+# TensorRT 11 isn't supported by ultralytics' exporter yet.
+tensorrt-cu12>=10.8,<11
