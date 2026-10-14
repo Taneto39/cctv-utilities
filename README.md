@@ -252,6 +252,16 @@ limit each connection's speed but not the total, so with few cameras raise
 `--connections` (e.g. `--connections 8` for 3 cameras) to use more
 connections in parallel.
 
+The progress board has a line per NVR (slots in use, downloads queued for
+one, download speed: average total since the start and per connection over
+the last 10 chunks), then one short line per camera. A camera's download
+state counts its chunks: `D` downloading, `w` waiting for a slot, `!`
+retrying, `rec` waiting for the NVR to finish recording, then `@` the next
+chunk's start; `R` means everything downloaded is waiting for the detector.
+Every downloaded chunk is also logged to
+`<root>/<nvr>_ch<N>/downloads.jsonl` (bytes, seconds, Mbps, slots busy), to
+tell whether the NVR or the network is the limit.
+
 ## censor.py / select_region.py
 
 Separate from the pipeline above: hides a region in every clip of a flat

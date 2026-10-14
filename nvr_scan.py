@@ -24,6 +24,7 @@ and passwords live in nvr-sdk/nvrs.env (path to nvr-sdk in this repo's .env).
 
 Every camera gets one folder that accumulates every run (<root>/<nvr>_ch<N>/):
     region.json            optional, from select-region
+    downloads.jsonl        one line per downloaded chunk: bytes, seconds, Mbps
     sightings/
       sightings.csv        one row per Sighting, all runs, rebuilt as Hits arrive
       images/              best keyframe per Sighting (boxes + Region outline)
@@ -660,16 +661,48 @@ class FairGate:
             self.cv.notify_all()
 
 
+class DownloadStats:
+    """Download throughput of one NVR, for the status board: the overall
+    average since the first download, and the per-connection speed of the
+    last few chunks (a single SDK download can be capped, see DESIGN.md)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.t0 = None
+        self.bytes = 0
+        self.recent = deque(maxlen=10)   # Mbps of the last chunks, one connection each
+
+    def started(self):
+        with self.lock:
+            if self.t0 is None:
+                self.t0 = time.time()
+
+    def add(self, nbytes, secs):
+        with self.lock:
+            self.bytes += nbytes
+            if secs > 0:
+                self.recent.append(nbytes * 8 / secs / 1e6)
+
+    def summary(self):
+        with self.lock:
+            if self.t0 is None or not self.recent:
+                return "speed ?"
+            total = self.bytes * 8 / max(time.time() - self.t0, 1e-6) / 1e6
+            per = sum(self.recent) / len(self.recent)
+            return f"{total:.0f} Mbps avg, {per:.1f}/conn"
+
+
 class NvrCameraJob:
     """Downloads one camera's chunks (a little ahead) and decodes their
     keyframes into the shared detector queue."""
 
-    def __init__(self, cam, store, chunks, q, args, stats, gate):
+    def __init__(self, cam, store, chunks, q, args, stats, gate, speed):
         self.cam, self.store, self.chunks, self.q = cam, store, chunks, q
-        self.args, self.stats, self.gate = args, stats, gate
+        self.args, self.stats, self.gate, self.speed = args, stats, gate, speed
         self.status = {"state": "starting"}   # set by the download threads, shown on the progress bar
         self.active = {}                      # chunk start -> its download state
         self.active_lock = threading.Lock()
+        self.log_lock = threading.Lock()      # downloads.jsonl, appended by several download threads
         self.bar = None
         self.on_progress = None
         self.ready = queue.Queue()
@@ -706,6 +739,31 @@ class NvrCameraJob:
                 self.status["state"] = self.active[first] + more
             else:
                 self.status["state"] = "downloaded ahead, waiting for detector"
+
+    def short_state(self):
+        """The download state in a few characters, so a camera fits on one
+        status-board line: counts of chunks downloading (D), waiting for an NVR
+        slot (w), retrying (!) and waiting for the NVR to finish recording (rec),
+        then the start of the next chunk in scan order; R = all downloaded chunks are
+        waiting for the detector, "all dl" = nothing left to download."""
+        with self.active_lock:
+            active = dict(self.active)
+        if not active:
+            state = self.status["state"]
+            return "all dl" if state == "all downloaded" else ("starting" if state == "starting" else "R")
+        counts = Counter()
+        for s in active.values():
+            if s.startswith(("downloading", "keyframes")):
+                counts["D"] += 1
+            elif s.startswith("waiting for NVR slot"):
+                counts["w"] += 1
+            elif s.startswith("retrying"):
+                counts["!"] += 1
+            else:
+                counts["rec"] += 1
+        parts = [f"{k}{counts[k]}" for k in ("D", "w", "!", "rec") if counts[k]]
+        nxt = min(active) if self.args.direction == "forward" else max(active)
+        return " ".join(parts) + f" @{nxt:%H:%M}"
 
     def _download_all(self):
         # Several chunks of one camera download at once (up to --prefetch + 1),
@@ -748,6 +806,8 @@ class NvrCameraJob:
             self._set_state(cs, f"waiting for NVR slot {cs:%H:%M}-{ce:%H:%M}")
             self.gate.acquire(priority)
             self._set_state(cs, f"{what} {cs:%H:%M}-{ce:%H:%M}")
+            self.speed.started()
+            t = time.time()
             try:
                 result = fetch(cs, ce, str(dst), timeout=self.args.chunk_timeout)
             except Exception as e:  # SDK hiccup: retry like a failed download
@@ -755,6 +815,8 @@ class NvrCameraJob:
                 result = False
             finally:
                 self.gate.release()
+            if result:
+                self._record_download(cs, ce, dst, time.time() - t, attempt)
             if result is not False:
                 break
             if attempt < DOWNLOAD_RETRIES:
@@ -771,6 +833,25 @@ class NvrCameraJob:
                 _log(f"[{self.store.cam_id}] keyframe time {cs:%H:%M:%S} unreadable ({e}), using chunk start")
         self._set_state(cs, None)
         return cs, ce, dst if result else None, result, base
+
+    def _record_download(self, cs, ce, dst, secs, attempt):
+        """Feed one finished download into the NVR's speed and append it to
+        <camera>/downloads.jsonl, to tell an NVR cap from a network one later."""
+        try:
+            nbytes = os.path.getsize(dst)
+        except OSError:
+            return
+        self.speed.add(nbytes, secs)
+        rec = {"time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "nvr": self.cam.nvr_name,
+               "chunk": f"{cs:%Y-%m-%d %H:%M:%S}", "chunk_s": (ce - cs).total_seconds(),
+               "mode": "keyframes" if self.keyframes else "full", "bytes": nbytes,
+               "secs": round(secs, 2), "mbps": round(nbytes * 8 / max(secs, 1e-6) / 1e6, 2),
+               "slots_busy": self.gate.busy, "attempt": attempt}
+        try:
+            with self.log_lock, open(self.store.dir / "downloads.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
 
     def _decode_all(self):
         cam_id = self.store.cam_id
@@ -862,7 +943,7 @@ def run_nvr(args):
     q = queue.Queue(maxsize=args.batch_size * 8)
     stats = {c: {"ok": 0, "no_footage": 0, "failed": [], "skipped": 0} for c in cams}
     jobs, total_s = [], 0.0
-    gates = {}   # one per NVR, shared by its cameras
+    gates, speeds = {}, {}   # one each per NVR, shared by its cameras
     for cam_id, cam in cams.items():
         store = stores[cam_id]
         store.load_coverage(det.fingerprint(cam_id, args.model), args.restart)
@@ -871,7 +952,8 @@ def run_nvr(args):
         total_s += sum((ce - cs).total_seconds() for cs, ce in todo)
         if todo:
             gate = gates.setdefault(cam.nvr_name, FairGate(args.connections))
-            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate)))
+            speed = speeds.setdefault(cam.nvr_name, DownloadStats())
+            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate, speed)))
     print(f"[object-scan nvr] {len(cams)} camera(s), {args.direction} {lo:%Y-%m-%d %H:%M:%S} -> "
           f"{hi:%Y-%m-%d %H:%M:%S}, {len(chunks_all)} chunk(s) of {args.chunk_min} min each per camera"
           + "".join(f"\n  {c}: {stats[c]['skipped']} chunk(s) already scanned" for c in cams if stats[c]["skipped"]))
@@ -886,6 +968,9 @@ def run_nvr(args):
         done[cam_id] += sec
         done["all"] += sec
 
+    by_nvr = {}   # NVR name -> [(cam_id, job)], in camera order
+    for cam_id, job in jobs:
+        by_nvr.setdefault(job.cam.nvr_name, []).append((cam_id, job))
     width = max([len(c) for c in cams] + [3])
 
     def bar(frac, n=20):
@@ -897,19 +982,30 @@ def run_nvr(args):
         return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
 
     def status_lines():
-        # one line for everything, then one per camera showing how far into the
-        # footage it has got (wall-clock time of the last keyframe scanned)
+        # one line for everything, then per NVR: a summary line (progress, how far
+        # into the footage its slowest camera is, slots, download speed) and its
+        # cameras packed several to a line -- one line per camera filled the screen
         elapsed = time.time() - t0
         frac = done["all"] / total_s if total_s else 1.0
         eta = hms(elapsed * (total_s - done["all"]) / done["all"]) if done["all"] else "?"
-        lines = [f"{'all'.ljust(width)} [{bar(frac)}] {frac:4.0%} {done['all']:.0f}/{total_s:.0f}s footage "
-                 f"| {hms(elapsed)} elapsed, ~{eta} left | {det.n_frames} keyframes, hits {sum(det.n_hits.values())}"]
-        for cam_id, job in jobs:
-            frac = done[cam_id] / job.total_s if job.total_s else 1.0
-            at = det.last_t.get(cam_id)
-            state = "done" if frac >= 1 else job.status["state"]
-            lines.append(f"{cam_id.ljust(width)} [{bar(frac)}] {frac:4.0%} | at {f'{at:%m-%d %H:%M:%S}' if at else '-':14} "
-                         f"| hits {det.n_hits[cam_id]:<4} | {state}")
+        lines = [f"{'all'.ljust(width)} [{bar(frac, 10)}] {frac:4.0%} | {hms(elapsed)}, ~{eta} left "
+                 f"| {det.n_frames} kf, {det.n_frames / max(elapsed, 1e-6):.0f}/s | hits {sum(det.n_hits.values())}"]
+        for name, members in by_nvr.items():
+            # per NVR: slots in use, downloads queued for one, download speed
+            gate = gates[name]
+            if all(done[c] >= job.total_s for c, job in members):
+                lines.append(f"{name}: done")
+            else:
+                lines.append(f"{name}: slots {gate.busy}/{gate.n}, {len(gate.waiting)} queued | "
+                             f"{speeds[name].summary()}")
+            # then one short line per camera, so it fits without being cut off
+            for cam_id, job in members:
+                frac = done[cam_id] / job.total_s if job.total_s else 1.0
+                at = det.last_t.get(cam_id)
+                state = "done" if frac >= 1 else job.short_state()
+                lines.append(f"{cam_id.ljust(width)} [{bar(frac, 10)}] {frac:4.0%} | "
+                             f"{f'{at:%m-%d %H:%M:%S}' if at else '-':14} | hits {det.n_hits[cam_id]:<4} | {state}")
+        lines.append("D downloading, w slot wait, ! retry, rec still recording, @ next chunk, R detector wait")
         return lines
 
     global _board
