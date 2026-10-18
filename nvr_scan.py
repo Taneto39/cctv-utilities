@@ -531,6 +531,13 @@ class Detector:
         self.on_hits = None
         for cam_id, store in stores.items():
             self.imgsz[cam_id] = args.imgsz or (640 if store.region else 1280)
+        # one predict() sets up ultralytics' predictor (conf/classes included);
+        # after that _prepare/_finish drive its stages directly
+        self.model.predict(np.zeros((64, 64, 3), np.uint8), imgsz=640, conf=self.conf,
+                           classes=self.class_ids, verbose=False)
+        self.predictor = self.model.predictor
+        self.prep_pool = ThreadPoolExecutor(max_workers=1)
+        self.pending = None   # Future of the next batch being prepared
 
     def fingerprint(self, cam_id, model_path):
         st = self.stores[cam_id]
@@ -546,12 +553,47 @@ class Detector:
             self.crops[key] = osc.region_crop_box(store.region["points"], w, h)
         return self.crops[key]
 
-    def _run_batch(self, batch):
-        # one predict() per (imgsz, input size): ultralytics letterboxes a batch of
+    # Batches run in two stages so the GPU never waits on the CPU: _prepare
+    # (crop, letterbox, upload; ~4.6ms/image) runs on prep_pool for batch k+1
+    # while _finish (TensorRT inference ~5.7ms/image, NMS, Hits) runs batch k.
+    # In one predict() call those ran back to back and the GPU idled ~45% of the
+    # time: ~95 -> ~150 images/s, boxes identical to predict() (DESIGN.md
+    # "Overlapped preprocessing").
+
+    def _submit(self, batch):
+        nxt = self.prep_pool.submit(self._prepare, batch)
+        self.flush()
+        self.pending = nxt
+
+    def flush(self):
+        """Finish the batch being prepared, if any."""
+        if self.pending is not None:
+            groups, n = self.pending.result()
+            self.pending = None
+            self._finish(groups, n)
+
+    def _letterbox(self, imgs, imgsz):
+        """predict()'s preprocessing, bit for bit: the same LetterBox, then
+        BGR->RGB, HWC->CHW and /255 done on the GPU instead of in numpy."""
+        import torch  # deferred like ultralytics in object_scan.py: --help shouldn't need them
+        from ultralytics.data.augment import LetterBox
+        from ultralytics.utils.checks import check_imgsz
+        p = self.predictor
+        sz = check_imgsz(imgsz, stride=p.model.stride, min_dim=2)
+        auto = (len({x.shape for x in imgs}) == 1 and p.args.rect
+                and (p.model.format == "pt" or (getattr(p.model, "dynamic", False) and p.model.format != "imx")))
+        lb = LetterBox(sz, auto=auto, stride=p.model.stride)
+        t = torch.from_numpy(np.stack([lb(image=x) for x in imgs])).to(p.device)
+        t = t.flip(-1).permute(0, 3, 1, 2).contiguous()
+        t = t.half() if p.model.fp16 else t.float()
+        return t / 255
+
+    def _prepare(self, batch):
+        # one inference per (imgsz, input size): ultralytics letterboxes a batch of
         # mixed sizes to a square instead of each image's own rectangle, which
         # changes detections (a 0.40 Hit vanished when a 2688x1520 frame shared a
         # batch with 2560x1440 ones) -- so cameras of different resolutions, or
-        # with / without a Region, never share a predict() call
+        # with / without a Region, never share a batch
         groups = {}
         for item in batch:
             _, cam_id, t, frame, src = item
@@ -570,8 +612,14 @@ class Detector:
             g[0].append(item)
             g[1].append(img)
             g[2].append(off)
-        for (imgsz, _), (items, imgs, offs) in groups.items():
-            results = self.model.predict(imgs, imgsz=imgsz, conf=self.conf, classes=self.class_ids, verbose=False)
+        return [(items, imgs, offs, self._letterbox(imgs, imgsz))
+                for (imgsz, _), (items, imgs, offs) in groups.items()], len(batch)
+
+    def _finish(self, groups, n):
+        p = self.predictor
+        for items, imgs, offs, tensor in groups:
+            p.batch = ([""] * len(imgs), imgs, [""] * len(imgs))   # postprocess reads paths from it
+            results = p.postprocess(p.inference(tensor), tensor, imgs)
             for (_, cam_id, t, frame, src), (ox, oy), r in zip(items, offs, results):
                 self.last_t[cam_id] = t
                 if not len(r.boxes):
@@ -590,7 +638,7 @@ class Detector:
                 self.n_hits[cam_id] += len(hits)
                 if self.on_hits:
                     self.on_hits(cam_id)
-        self.n_frames += len(batch)
+        self.n_frames += n
 
     def run(self, q, n_producers, on_hits=None, idle=None, tick=None):
         """Consumes q until every producer has sent "done". `idle` (if given)
@@ -606,8 +654,9 @@ class Detector:
                 item = q.get(timeout=0.5)
             except queue.Empty:
                 if batch:
-                    self._run_batch(batch)
+                    self._submit(batch)
                     batch = []
+                self.flush()
                 if idle:
                     idle()
                 continue
@@ -615,12 +664,13 @@ class Detector:
             if kind == "frame":
                 batch.append(item)
                 if len(batch) >= self.batch_size:
-                    self._run_batch(batch)
+                    self._submit(batch)
                     batch = []
                 continue
             if batch:
-                self._run_batch(batch)
+                self._submit(batch)
                 batch = []
+            self.flush()   # a mark runs only after every earlier frame's Hits are written
             if kind == "mark":
                 item[2]()
             elif kind == "done":
@@ -661,6 +711,107 @@ class FairGate:
             self.cv.notify_all()
 
 
+def _vram_reader():
+    """A function returning the GPU's (used, total) VRAM bytes (all
+    processes, not just this one), or None when it can't be read. NVML
+    (nvidia-ml-py) sees the ffmpeg decoders' memory too; torch's mem_get_info
+    is the fallback."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+        def read():
+            m = pynvml.nvmlDeviceGetMemoryInfo(h)
+            return m.used, m.total
+        read()
+        return read
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            def read():
+                free, total = torch.cuda.mem_get_info()
+                return total - free, total
+            read()
+            return read
+    except Exception:
+        pass
+    return lambda: None
+
+
+class DecoderGate:
+    """Caps concurrent keyframe decoders (one ffmpeg + NVDEC session each)
+    across every camera, sized automatically. With one decoder thread per
+    camera and the detector as the bottleneck, every camera's ffmpeg sat
+    blocked on the full frame queue while still holding its CUDA context,
+    NVDEC surfaces and ~0.5GB of RAM: 31 of them at 32 cameras filled VRAM,
+    pushed the detector into shared GPU memory and cut it from ~90 to 19
+    keyframes/s (DESIGN.md "Decoder gate"). A new decoder starts only while
+    the detector is short of frames (queue under half full) and VRAM is under
+    `vram_limit`; one always may, so nothing deadlocks. Like FairGate, the
+    camera furthest behind goes first."""
+
+    # A just-started ffmpeg takes ~1s to allocate its VRAM, so decoders started
+    # in the last SETTLE_S count as DECODER_VRAM each on top of the reading.
+    # (A plain "wait SETTLE_S after each start" capped it at one decoder: a
+    # chunk decodes in ~2s, so every replacement reset the wait.)
+    SETTLE_S = 2.0
+    DECODER_VRAM = 512 * 2**20
+
+    def __init__(self, q, vram_limit):
+        self.q, self.limit = q, vram_limit
+        self.read_vram = _vram_reader()
+        self.busy = self.peak = 0
+        self.starts = deque()   # start times of recent decoders
+        self.cv = threading.Condition()
+        self.waiting = []   # heap of (priority, seq)
+        self.seq = 0
+
+    def _may_start(self):
+        if self.busy == 0:
+            return True
+        if self.q.qsize() >= self.q.maxsize // 2:
+            return False
+        vram = self.read_vram()
+        if vram is None:
+            return True
+        now = time.time()
+        while self.starts and now - self.starts[0] > self.SETTLE_S:
+            self.starts.popleft()
+        used, total = vram
+        return used + len(self.starts) * self.DECODER_VRAM < self.limit * total
+
+    def acquire(self, priority):
+        with self.cv:
+            self.seq += 1
+            entry = (priority, self.seq)
+            heapq.heappush(self.waiting, entry)
+            # timed wait: queue depth and VRAM change without anyone notifying
+            while self.waiting[0] != entry or not self._may_start():
+                self.cv.wait(timeout=0.5)
+            heapq.heappop(self.waiting)
+            self.busy += 1
+            self.peak = max(self.peak, self.busy)
+            self.starts.append(time.time())
+            self.cv.notify_all()
+
+    def release(self):
+        with self.cv:
+            self.busy -= 1
+            self.cv.notify_all()
+
+    def summary(self):
+        # decoders running (+ chunks downloaded and waiting for one), frames
+        # queued for the detector: a full queue = detector-bound, an empty one
+        # with nothing waiting = download-bound
+        vram = self.read_vram()
+        wait = f"+{len(self.waiting)}w" if self.waiting else ""
+        return (f"dec {self.busy}{wait}, q {self.q.qsize()}/{self.q.maxsize}"
+                + (f", VRAM {vram[0] / vram[1]:.0%}" if vram is not None else ""))
+
+
 class DownloadStats:
     """Download throughput of one NVR, for the status board: the overall
     average since the first download, and the per-connection speed of the
@@ -696,9 +847,10 @@ class NvrCameraJob:
     """Downloads one camera's chunks (a little ahead) and decodes their
     keyframes into the shared detector queue."""
 
-    def __init__(self, cam, store, chunks, q, args, stats, gate, speed):
+    def __init__(self, cam, store, chunks, q, args, stats, gate, speed, decoders):
         self.cam, self.store, self.chunks, self.q = cam, store, chunks, q
         self.args, self.stats, self.gate, self.speed = args, stats, gate, speed
+        self.decoders = decoders              # DecoderGate shared by every camera
         self.status = {"state": "starting"}   # set by the download threads, shown on the progress bar
         self.active = {}                      # chunk start -> its download state
         self.active_lock = threading.Lock()
@@ -863,6 +1015,7 @@ class NvrCameraJob:
                 cs, ce, path, result, base = item
                 ok = True
                 if path is not None:
+                    self.decoders.acquire(_ts(cs) if self.args.direction == "forward" else -_ts(cs))
                     try:
                         for offset, frame in osc.iter_keyframes(path):
                             self.q.put(("frame", cam_id, base + timedelta(seconds=offset), frame, "nvr"))
@@ -870,6 +1023,7 @@ class NvrCameraJob:
                         _log(f"[{cam_id}] decode {cs:%H:%M:%S} failed: {e}")
                         ok = False
                     finally:
+                        self.decoders.release()
                         try:
                             os.remove(path)
                         except OSError:
@@ -941,6 +1095,7 @@ def run_nvr(args):
 
     det = Detector(args, stores)
     q = queue.Queue(maxsize=args.batch_size * 8)
+    decoders = DecoderGate(q, args.vram_limit / 100)
     stats = {c: {"ok": 0, "no_footage": 0, "failed": [], "skipped": 0} for c in cams}
     jobs, total_s = [], 0.0
     gates, speeds = {}, {}   # one each per NVR, shared by its cameras
@@ -953,7 +1108,7 @@ def run_nvr(args):
         if todo:
             gate = gates.setdefault(cam.nvr_name, FairGate(args.connections))
             speed = speeds.setdefault(cam.nvr_name, DownloadStats())
-            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate, speed)))
+            jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate, speed, decoders)))
     print(f"[object-scan nvr] {len(cams)} camera(s), {args.direction} {lo:%Y-%m-%d %H:%M:%S} -> "
           f"{hi:%Y-%m-%d %H:%M:%S}, {len(chunks_all)} chunk(s) of {args.chunk_min} min each per camera"
           + "".join(f"\n  {c}: {stats[c]['skipped']} chunk(s) already scanned" for c in cams if stats[c]["skipped"]))
@@ -981,15 +1136,26 @@ def run_nvr(args):
         s = int(s)
         return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
 
+    rate_hist = deque()   # (time, det.n_frames) samples for the recent keyframe rate
+
     def status_lines():
         # one line for everything, then per NVR: a summary line (progress, how far
         # into the footage its slowest camera is, slots, download speed) and its
         # cameras packed several to a line -- one line per camera filled the screen
-        elapsed = time.time() - t0
+        now = time.time()
+        elapsed = now - t0
         frac = done["all"] / total_s if total_s else 1.0
         eta = hms(elapsed * (total_s - done["all"]) / done["all"]) if done["all"] else "?"
+        # keyframes/s over the last ~30s: the since-start average hides the
+        # slow start-up (first downloads) and any later change
+        rate_hist.append((now, det.n_frames))
+        while len(rate_hist) > 2 and now - rate_hist[1][0] >= 30:
+            rate_hist.popleft()
+        t_old, n_old = rate_hist[0]
+        recent = (det.n_frames - n_old) / max(now - t_old, 1e-6)
         lines = [f"{'all'.ljust(width)} [{bar(frac, 10)}] {frac:4.0%} | {hms(elapsed)}, ~{eta} left "
-                 f"| {det.n_frames} kf, {det.n_frames / max(elapsed, 1e-6):.0f}/s | hits {sum(det.n_hits.values())}"]
+                 f"| {det.n_frames} kf, {recent:.0f}/s | {decoders.summary()} "
+                 f"| hits {sum(det.n_hits.values())}"]
         for name, members in by_nvr.items():
             # per NVR: slots in use, downloads queued for one, download speed
             gate = gates[name]
@@ -1060,7 +1226,7 @@ def run_nvr(args):
     elapsed = time.time() - t0
     if det.n_frames:
         print(f"[object-scan nvr] {det.n_frames} keyframes in {elapsed:.0f}s "
-              f"({total_s / max(elapsed, 1e-6):.0f}x real time over all cameras)")
+              f"({total_s / max(elapsed, 1e-6):.0f}x real time over all cameras, up to {decoders.peak} decoder(s) at once)")
     for cam_id, store in stores.items():
         sightings = store.write_outputs(args.gap)
         st = stats[cam_id]
@@ -1220,6 +1386,9 @@ def main(argv):
     p.add_argument("--full-download", action="store_true",
                    help="Dahua: download full footage instead of fetching keyframes only (the default for "
                         "Dahua; Hikvision always downloads full footage).")
+    p.add_argument("--vram-limit", type=float, default=95,
+                   help="Start another keyframe decoder (ffmpeg/NVDEC) only while GPU memory use is under this "
+                        "percent and the detector is short of frames (default 95). One decoder always runs.")
     p.add_argument("--restart", action="store_true", help="Forget which stretches were already scanned.")
     _detector_args(p)
 

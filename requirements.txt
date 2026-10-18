@@ -14,6 +14,8 @@ tqdm
 # Second-pass object detection -- detect_objects.py
 # (pulls in torch automatically; comment out if you only need motion_scan.py)
 ultralytics
+# GPU memory reading for object_scan.py nvr's decoder gate (falls back to torch)
+nvidia-ml-py
 
 # Optional: ~2.5x faster object_scan.py via a TensorRT engine (see README):
 #   pip install -r requirements-trt.txt
