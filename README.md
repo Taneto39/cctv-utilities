@@ -252,6 +252,12 @@ limit each connection's speed but not the total, so with few cameras raise
 `--connections` (e.g. `--connections 8` for 3 cameras) to use more
 connections in parallel.
 
+Keyframe decoders (one ffmpeg/NVDEC process per chunk) are capped across
+all cameras automatically. A new one starts only while the detector is short
+of frames and GPU memory is under `--vram-limit` (default 95%). With many
+cameras, an uncapped decoder per camera would fill VRAM and slow the
+detector down.
+
 The progress board has a line per NVR (slots in use, downloads queued for
 one, download speed: average total since the start and per connection over
 the last 10 chunks), then one short line per camera. A camera's download
