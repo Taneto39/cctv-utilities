@@ -256,7 +256,10 @@ Keyframe decoders (one ffmpeg/NVDEC process per chunk) are capped across
 all cameras automatically. A new one starts only while the detector is short
 of frames and GPU memory is under `--vram-limit` (default 95%). With many
 cameras, an uncapped decoder per camera would fill VRAM and slow the
-detector down.
+detector down. The `all` status line shows `dec N+Mw, q x/64`: decoders
+running, chunks waiting for one, and frames queued for the detector. A full
+queue means the run is detector-bound. An empty queue with nothing waiting
+means it is download-bound.
 
 The progress board has a line per NVR (slots in use, downloads queued for
 one, download speed: average total since the start and per connection over
