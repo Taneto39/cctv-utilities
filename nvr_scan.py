@@ -536,6 +536,9 @@ class Detector:
         self.model.predict(np.zeros((64, 64, 3), np.uint8), imgsz=640, conf=self.conf,
                            classes=self.class_ids, verbose=False)
         self.predictor = self.model.predictor
+        # an end-to-end model (yolo26) outputs a small (batch, 300, 6) tensor whose
+        # "NMS" is only a few masks per image; on the GPU each one is a sync point
+        self.cpu_post = bool(getattr(self.predictor.model, "end2end", False))
         self.prep_pool = ThreadPoolExecutor(max_workers=1)
         self.pending = None   # Future of the next batch being prepared
 
@@ -619,7 +622,13 @@ class Detector:
         p = self.predictor
         for items, imgs, offs, tensor in groups:
             p.batch = ([""] * len(imgs), imgs, [""] * len(imgs))   # postprocess reads paths from it
-            results = p.postprocess(p.inference(tensor), tensor, imgs)
+            preds = p.inference(tensor)
+            if self.cpu_post:
+                # one copy, then postprocess on the CPU: bit-identical boxes, and the
+                # main thread no longer waits on a GPU sync per mask (DESIGN.md
+                # "Postprocess on the CPU")
+                preds = (preds[0] if isinstance(preds, (list, tuple)) else preds).cpu()
+            results = p.postprocess(preds, tensor, imgs)
             for (_, cam_id, t, frame, src), (ox, oy), r in zip(items, offs, results):
                 self.last_t[cam_id] = t
                 if not len(r.boxes):
