@@ -1119,7 +1119,7 @@ def run_nvr(args):
         stats[cam_id]["skipped"] = len(chunks_all) - len(todo)
         total_s += sum((ce - cs).total_seconds() for cs, ce in todo)
         if todo:
-            gate = gates.setdefault(cam.nvr_name, FairGate(args.connections))
+            gate = gates.setdefault(cam.nvr_name, FairGate(cam.max_connections))
             speed = speeds.setdefault(cam.nvr_name, DownloadStats())
             jobs.append((cam_id, NvrCameraJob(cam, store, todo, q, args, stats, gate, speed, decoders)))
     print(f"[object-scan nvr] {len(cams)} camera(s), {args.direction} {lo:%Y-%m-%d %H:%M:%S} -> "
@@ -1392,7 +1392,8 @@ def main(argv):
     p.add_argument("--chunk-min", type=int, default=5, help="Download chunk length in minutes (default 5).")
     p.add_argument("--connections", type=int, default=4,
                    help="Max concurrent downloads per NVR, shared fairly by its cameras "
-                        "(default 4; some NVRs error under more).")
+                        "(default 4; some NVRs error under more). An NVR's "
+                        "NVR_<NAME>_MAX_CONNECTIONS in nvrs.env caps it for that NVR.")
     p.add_argument("--prefetch", type=int, default=2, help="Chunks downloaded ahead per camera (default 2). Up to this + 1 chunks "
                         "of one camera download in parallel, still capped by --connections.")
     p.add_argument("--chunk-timeout", type=int, default=300, help="Seconds before a chunk download is abandoned.")
