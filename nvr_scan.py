@@ -901,12 +901,15 @@ class NvrCameraJob:
             else:
                 self.status["state"] = "downloaded ahead, waiting for detector"
 
-    def short_state(self):
+    def short_state(self, at=None):
         """The download state in a few characters, so a camera fits on one
         status-board line: counts of chunks downloading (D), waiting for an NVR
         slot (w), retrying (!) and waiting for the NVR to finish recording (rec),
         then the start of the next chunk in scan order; R = all downloaded chunks are
-        waiting for the detector, "all dl" = nothing left to download."""
+        waiting for the detector, "all dl" = nothing left to download. The next
+        chunk carries its date when it isn't on `at`'s day (the camera's last
+        scanned time): skipping already-scanned time can jump it days away, and
+        a bare HH:MM then reads as the wrong day."""
         with self.active_lock:
             active = dict(self.active)
         if not active:
@@ -924,7 +927,8 @@ class NvrCameraJob:
                 counts["rec"] += 1
         parts = [f"{k}{counts[k]}" for k in ("D", "w", "!", "rec") if counts[k]]
         nxt = min(active) if self.args.direction == "forward" else max(active)
-        return " ".join(parts) + f" @{nxt:%H:%M}"
+        fmt = "%H:%M" if at is not None and nxt.date() == at.date() else "%m-%d %H:%M"
+        return " ".join(parts) + f" @{nxt:{fmt}}"
 
     def _download_all(self):
         # Several chunks of one camera download at once (up to --prefetch + 1),
@@ -1177,7 +1181,7 @@ def run_nvr(args):
             for cam_id, job in members:
                 frac = done[cam_id] / job.total_s if job.total_s else 1.0
                 at = det.last_t.get(cam_id)
-                state = "done" if frac >= 1 else job.short_state()
+                state = "done" if frac >= 1 else job.short_state(at)
                 lines.append(f"{cam_id.ljust(width)} [{bar(frac, 10)}] {frac:4.0%} | "
                              f"{f'{at:%m-%d %H:%M:%S}' if at else '-':14} | hits {det.n_hits[cam_id]:<4} | {state}")
         lines.append("D downloading, w slot wait, ! retry, rec still recording, @ next chunk, R detector wait")
