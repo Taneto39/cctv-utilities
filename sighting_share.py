@@ -42,41 +42,63 @@ import cv2
 import numpy as np
 
 import nvr_scan
-from object_scan import read_hits
 from select_region import load_region
 from sighting_wall import _read_csv
 
 FMT = "%Y-%m-%d %H:%M:%S"
 
 
-def _sightings(root, cameras):
+def _stamp(path):
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def _sightings(root, cameras, cache):
+    """Every camera's Sighting rows. `cache` (camera -> (stamps, rows)) skips
+    re-parsing a camera whose sightings.csv and index haven't changed, so a
+    poll stays cheap however many Sightings have piled up."""
     for csv_path in sorted(Path(root).glob("*/sightings/sightings.csv")):
         camera = csv_path.parent.parent.name
         if cameras and camera not in cameras:
             continue
+        index_path = csv_path.parent / "images" / ".index.json"
+        stamps = (_stamp(csv_path), _stamp(index_path))
+        cached = cache.get(camera)
+        if cached and cached[0] == stamps:
+            yield from cached[1]
+            continue
+        rows = list(_parse_sightings(csv_path, index_path, camera))
+        cache[camera] = (stamps, rows)
+        yield from rows
+
+
+def _parse_sightings(csv_path, index_path, camera):
+    try:
+        index = json.loads(index_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        index = {}
+    rows = []
+    for r in _read_csv(csv_path):
+        frame = index.get(r.get("image", ""))
+        if not frame:    # no picture, or index not written yet: picked up next poll
+            continue
         try:
-            index = json.loads((csv_path.parent / "images" / ".index.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            index = {}
-        rows = []
-        for r in _read_csv(csv_path):
-            frame = index.get(r.get("image", ""))
-            if not frame:    # no picture, or index not written yet: picked up next poll
-                continue
-            try:
-                r["start"] = datetime.strptime(r["start"], FMT)
-                r["end"] = datetime.strptime(r["end"], FMT)
-            except (KeyError, ValueError):
-                continue
-            r["camera"] = camera
-            r["frame"] = frame
-            r["frame_path"] = csv_path.parent / "frames" / frame
-            rows.append(r)
-        clash = Counter(r["start"] for r in rows)
-        for r in rows:
-            name = f"{r['start']:%Y%m%d-%H%M%S}-{camera}"
-            r["name"] = (name if clash[r["start"]] == 1 else f"{name}-{r['target']}") + ".jpg"
-            yield r
+            r["start"] = datetime.strptime(r["start"], FMT)
+            r["end"] = datetime.strptime(r["end"], FMT)
+        except (KeyError, ValueError):
+            continue
+        r["camera"] = camera
+        r["frame"] = frame
+        r["frame_path"] = csv_path.parent / "frames" / frame
+        rows.append(r)
+    clash = Counter(r["start"] for r in rows)
+    for r in rows:
+        name = f"{r['start']:%Y%m%d-%H%M%S}-{camera}"
+        r["name"] = (name if clash[r["start"]] == 1 else f"{name}-{r['target']}") + ".jpg"
+        yield r
 
 
 class Overlay:
@@ -85,23 +107,51 @@ class Overlay:
 
     def __init__(self, root):
         self.root = Path(root)
-        self.cache = {}      # camera -> (hits files' mtimes, region, hits by frame)
+        self.cache = {}      # camera -> {region stamp, region, read position per hits file, hits by frame}
 
     def _load(self, camera):
+        """Hits files are append-only while a scan runs, so only the bytes
+        added since the last call are parsed -- re-reading the whole file on
+        every append (Live Watch appends constantly) got slower the longer
+        this ran. Starts over when a file shrinks or is replaced (the scan
+        moves hits_nvr.jsonl aside to a .bak when its settings change)."""
         cam_dir = self.root / camera
-        paths = [cam_dir / "sightings" / f"hits_{src}.jsonl" for src in ("nvr", "live")]
-        key = tuple(p.stat().st_mtime if p.exists() else 0 for p in paths)
-        cached = self.cache.get(camera)
-        if cached and cached[0] == key:
-            return cached[1], cached[2]
+        c = self.cache.setdefault(camera, {"region_stamp": None, "region": None, "pos": {}, "by_frame": {}})
         region_path = cam_dir / "region.json"
-        region = load_region(region_path) if region_path.exists() else None
-        by_frame = {}
-        for p in paths:
-            for h in read_hits(p):
-                by_frame.setdefault(h.get("frame"), []).append(h)
-        self.cache[camera] = (key, region, by_frame)
-        return region, by_frame
+        stamp = _stamp(region_path)
+        if stamp != c["region_stamp"]:
+            c["region"] = load_region(region_path) if stamp else None
+            c["region_stamp"] = stamp
+        files = {}
+        for src in ("nvr", "live"):
+            p = cam_dir / "sightings" / f"hits_{src}.jsonl"
+            try:
+                st = p.stat()
+                files[p] = (st.st_ino, st.st_size)
+            except OSError:
+                files[p] = (None, 0)
+        if any(p in c["pos"] and (ino != c["pos"][p][0] or size < c["pos"][p][1])
+               for p, (ino, size) in files.items()):
+            c["pos"], c["by_frame"] = {}, {}
+        for p, (ino, size) in files.items():
+            pos = c["pos"].get(p, (ino, 0))[1]
+            if size <= pos:
+                continue
+            try:
+                with open(p, "rb") as f:
+                    f.seek(pos)
+                    data = f.read(size - pos)
+            except OSError:
+                continue
+            end = data.rfind(b"\n") + 1     # a torn last line waits for the next call
+            for line in data[:end].splitlines():
+                try:
+                    h = json.loads(line)
+                except ValueError:
+                    continue
+                c["by_frame"].setdefault(h.get("frame"), []).append(h)
+            c["pos"][p] = (ino, pos + end)
+        return c["region"], c["by_frame"]
 
     def boxes(self, r):
         _, by_frame = self._load(r["camera"])
@@ -246,12 +296,13 @@ def main():
                   flush=True)
     since = None if args.all else datetime.now().replace(microsecond=0)
     overlay = Overlay(args.root)
+    sightings_cache = {}
     done = {}                # file name -> frame name every version was made from
     print(f"[sighting-share] {Path(args.root).resolve()} -> {Path(args.dest).resolve()} "
           f"(raw/ + overlay/ + crop/) -- Ctrl+C to stop", flush=True)
     try:
         while True:
-            for r in _sightings(args.root, cameras):
+            for r in _sightings(args.root, cameras, sightings_cache):
                 if since is not None and r["end"] < since:
                     continue
                 if args.live_only and "live" not in r.get("source", ""):
