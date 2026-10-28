@@ -208,9 +208,16 @@ Setup: put the SDK wrappers in a folder of your choice and point
 addresses and credentials go in that folder's `nvrs.env`.
 
 Cameras are `<nvr name>:<channel>`, comma-separated. All cameras share one
-model instance.
+model instance. A bare NVR name (`--camera hik1,dahua1`) reads the camera names
+set on each NVR and opens a window to tick the ones to use (last ticks are
+remembered in `<root>/.camera_picks.json`; the equivalent `--camera` list is
+printed so the run can be repeated without the window). Bare and explicit
+entries can be mixed.
 
 ```bash
+# tick cameras from a list of names read off each NVR
+python object_scan.py nvr --camera hik1,dahua1 --from 09:00:00
+
 # from a past time forward until now, then exit
 python object_scan.py nvr --camera hik1:3,dahua1:1 --from 09:00:00
 python object_scan.py nvr --camera hik1:3 --from "2026-10-07 22:00:00"
