@@ -297,6 +297,7 @@ def main():
     since = None if args.all else datetime.now().replace(microsecond=0)
     overlay = Overlay(args.root)
     sightings_cache = {}
+    missing = set()          # frame paths found gone; a frame is written before the index names it
     done = {}                # file name -> frame name every version was made from
     print(f"[sighting-share] {Path(args.root).resolve()} -> {Path(args.dest).resolve()} "
           f"(raw/ + overlay/ + crop/) -- Ctrl+C to stop", flush=True)
@@ -314,6 +315,14 @@ def main():
                 if (name not in done and _same_file(r["frame_path"], raw_out)
                         and overlay_out.exists() and _old_crops(crop_dir, name)):
                     done[name] = r["frame"]      # already copied by an earlier run
+                    continue
+                if r["frame_path"] in missing:
+                    continue
+                if not r["frame_path"].exists():
+                    # Frame deleted or moved out (e.g. old frames cleared to save
+                    # space): the index still names it until the next scan
+                    # rebuilds it, so skip quietly instead of retrying every poll.
+                    missing.add(r["frame_path"])
                     continue
                 frame = cv2.imread(str(r["frame_path"]))
                 if frame is None:
