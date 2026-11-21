@@ -203,7 +203,7 @@ vendor SDKs, scans each chunk and deletes it, keeping only results. Windows
 only (the SDKs are Windows DLLs). The vendor SDKs are used rather than
 ISAPI.
 
-Setup: put the SDK wrappers in a folder of your choice and point
+Setup: clone [nvr-sdk](https://github.com/Taneto39/nvr-sdk) (the SDK wrappers) and point
 `NVR_SDK_DIR` at it in `.env` (see [.env.example](.env.example)); NVR
 addresses and credentials go in that folder's `nvrs.env`.
 
@@ -212,7 +212,9 @@ model instance. A bare NVR name (`--camera hik1,dahua1`) reads the camera names
 set on each NVR and opens a window to tick the ones to use (last ticks are
 remembered in `<root>/.camera_picks.json`; the equivalent `--camera` list is
 printed so the run can be repeated without the window). Bare and explicit
-entries can be mixed.
+entries can be mixed; leaving out `--camera` lists every NVR in `nvrs.env`.
+NVRs are listed in parallel, and one that doesn't answer within 15 s is skipped.
+The picker itself lives in nvr-sdk (`camera_picker.py`).
 
 ```bash
 # tick cameras from a list of names read off each NVR
