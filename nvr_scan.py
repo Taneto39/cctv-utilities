@@ -253,108 +253,17 @@ def default_root():
 
 
 # --------------------------------------------------------------------------
-# Camera picker: a bare NVR name in --camera ("hik1") lists that NVR's cameras
-# by the names set on it and lets the user tick the ones to use.
+# Camera picker (nvr-sdk's camera_picker): --camera with bare NVR names, or no
+# --camera at all, opens a window listing those NVRs' cameras by name to tick.
 # --------------------------------------------------------------------------
 
 PICKS_FILE = ".camera_picks.json"   # in --root: last ticked cameras per NVR
-PICKER_ROWS = 16                    # checkboxes per column before wrapping
-DEFAULT_NAME = re.compile(r"^(channel|ipcamera|camera)\s*\d+$", re.I)   # never renamed = likely unused
 
 
 def resolve_cameras(nvr, spec, root):
-    """--camera -> [(nvr name, camera no)]. "hik1:15" entries pass through; bare
-    "hik1" entries open the picker for those NVRs."""
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    bare = [p.lower() for p in parts if ":" not in p]
-    fixed = nvr.parse_cameras(",".join(p for p in parts if ":" in p)) if len(bare) < len(parts) else []
-    if not bare:
-        return fixed
-    nvrs = nvr.load_nvrs()
-    listed = {}
-    for name in dict.fromkeys(bare):
-        if name not in nvrs:
-            raise SystemExit(f"No NVR named '{name}' in nvrs.env (have: {', '.join(sorted(nvrs))})")
-        print(f"[camera picker] reading camera names from {name}...", flush=True)
-        try:
-            listed[name] = nvr.list_cameras(name, nvrs=nvrs)
-        except (RuntimeError, SystemExit) as e:
-            print(f"[camera picker] {name} skipped: {e}")
-    if not listed:
-        raise SystemExit("No NVR could be listed.")
-    picks_path = Path(root) / PICKS_FILE
-    try:
-        picks = json.loads(picks_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        picks = {}
-    chosen = _pick_cameras(listed, picks, already=set(fixed))
-    if chosen is None:
-        raise SystemExit("[camera picker] cancelled.")
-    for name in listed:
-        picks[name] = [str(no) for n, no in chosen if n == name]
-    picks_path.parent.mkdir(parents=True, exist_ok=True)
-    picks_path.write_text(json.dumps(picks, indent=1), encoding="utf-8")
-    out = list(dict.fromkeys(fixed + chosen))
-    if not out:
-        raise SystemExit("[camera picker] no camera ticked.")
-    print(f"[camera picker] --camera {','.join(f'{n}:{no}' for n, no in out)}")
-    return out
-
-
-def _pick_cameras(listed, picks, already=()):
-    """Tk checklist, one frame per NVR. Returns [(nvr name, camera no)] or None (cancelled)."""
-    import tkinter as tk
-    from tkinter import ttk
-
-    root = tk.Tk()
-    root.title("Pick cameras")
-    result = {"ok": False}
-    boxes = []   # (nvr name, camera no, BooleanVar)
-    body = ttk.Frame(root, padding=8)
-    body.pack(fill="both", expand=True)
-    for col, (name, cams) in enumerate(listed.items()):
-        prev = set(picks.get(name, []))
-        frame = ttk.LabelFrame(body, text=f"{name} ({len(cams)})", padding=6)
-        frame.grid(row=0, column=col, sticky="nsew", padx=4)
-        own = []
-        for i, (no, cam_name) in enumerate(cams):
-            var = tk.BooleanVar(value=str(no) in prev or (name, no) in already)
-            label = f"{no}  {cam_name}" + ("  (default name)" if DEFAULT_NAME.match(cam_name) else "")
-            ttk.Checkbutton(frame, text=label, variable=var).grid(
-                row=1 + i % PICKER_ROWS, column=i // PICKER_ROWS, sticky="w", padx=(0, 12))
-            own.append(var)
-            boxes.append((name, no, var))
-        bar = ttk.Frame(frame)
-        bar.grid(row=0, column=0, columnspan=max(1, -(-len(cams) // PICKER_ROWS)), sticky="w", pady=(0, 4))
-        ttk.Button(bar, text="All", width=6, command=lambda vs=own: [v.set(True) for v in vs]).pack(side="left")
-        ttk.Button(bar, text="None", width=6, command=lambda vs=own: [v.set(False) for v in vs]).pack(side="left", padx=4)
-
-    def done(ok):
-        result["ok"] = ok
-        root.destroy()
-
-    foot = ttk.Frame(root, padding=(8, 0, 8, 8))
-    foot.pack(fill="x")
-    count = ttk.Label(foot)
-    count.pack(side="left")
-    ttk.Button(foot, text="Cancel", command=lambda: done(False)).pack(side="right")
-    ttk.Button(foot, text="OK", command=lambda: done(True)).pack(side="right", padx=4)
-
-    def update_count(*_):
-        count.config(text=f"{sum(v.get() for _, _, v in boxes)} ticked")
-    for _, _, v in boxes:
-        v.trace_add("write", update_count)
-    update_count()
-    root.bind("<Return>", lambda e: done(True))
-    root.bind("<Escape>", lambda e: done(False))
-    root.protocol("WM_DELETE_WINDOW", lambda: done(False))
-    root.attributes("-topmost", True)   # launched from a terminal: don't open behind it
-    root.after(300, lambda: root.attributes("-topmost", False))
-    root.focus_force()
-    root.mainloop()
-    if not result["ok"]:
-        return None
-    return [(name, no) for name, no, v in boxes if v.get()]
+    """--camera -> [(nvr name, camera no)] via nvr-sdk's camera_picker."""
+    from camera_picker import resolve_cameras as pick   # nvr-sdk, on sys.path after import_nvr()
+    return pick(spec, Path(root) / PICKS_FILE, nvrs=nvr.load_nvrs()).cameras
 
 
 # --------------------------------------------------------------------------
@@ -1466,10 +1375,10 @@ def run_select_region(args):
 # --------------------------------------------------------------------------
 
 def _common(p):
-    p.add_argument("--camera", required=True,
+    p.add_argument("--camera", default="",
                    help="Comma-separated <NVR name>:<camera number>, e.g. home-hik:15,shop-dahua:1 "
                         "(NVRs are listed in nvr-sdk/nvrs.env). A bare NVR name (home-hik) opens a window "
-                        "listing that NVR's cameras by name to tick.")
+                        "listing that NVR's cameras by name to tick; no --camera lists every NVR.")
     p.add_argument("--root", default=str(default_root()),
                    help="Where camera folders live (default: NVR_SCAN_ROOT in .env, else ./nvr_scans).")
 
